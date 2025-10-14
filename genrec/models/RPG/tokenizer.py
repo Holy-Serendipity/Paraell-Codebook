@@ -105,7 +105,7 @@ class RPGTokenizer(AbstractTokenizer):
         for i in range(1, dataset.n_items):
             meta_sentences.append(dataset.item2meta[dataset.id_mapping['id2item'][i]])
 
-        if 'sentence-transformers' in self.config['sent_emb_model']:
+        if 'models' in self.config['sent_emb_model']:
             sent_emb_model = SentenceTransformer(
                 self.config['sent_emb_model']
             ).to(self.config['device'])
