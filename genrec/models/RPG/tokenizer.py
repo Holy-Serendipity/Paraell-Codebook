@@ -13,7 +13,7 @@ from sentence_transformers import SentenceTransformer
 
 from genrec.dataset import AbstractDataset
 from genrec.tokenizer import AbstractTokenizer
-
+from FlagEmbedding import BGEM3FlagModel
 
 class RPGTokenizer(AbstractTokenizer):
     """
@@ -105,7 +105,7 @@ class RPGTokenizer(AbstractTokenizer):
         for i in range(1, dataset.n_items):
             meta_sentences.append(dataset.item2meta[dataset.id_mapping['id2item'][i]])
 
-        if 'models' in self.config['sent_emb_model']:
+        if 'MiniLM' in self.config['sent_emb_model']:
             sent_emb_model = SentenceTransformer(
                 self.config['sent_emb_model']
             ).to(self.config['device'])
@@ -117,6 +117,26 @@ class RPGTokenizer(AbstractTokenizer):
                 show_progress_bar=True,
                 device=self.config['device']
             )
+        elif 'bge' in self.config['sent_emb_model']:
+            sent_emb_model = BGEM3FlagModel(
+                model_name_or_path=self.config['sent_emb_model'],
+                use_fp16=True,
+                devices=self.config['device']
+            )
+            encoding_config={
+                'batch_size': self.config['sent_emb_batch_size'],
+                'max_length': 8192,
+                'return_dense':True,
+                'return_sparse':False,
+                'return_colbert_vecs':False
+            }
+
+            encode_results = sent_emb_model.encode(
+                meta_sentences, **encoding_config
+            )
+
+            sent_embs = encode_results['dense_vecs']
+
         elif 'text-embedding-3' in self.config['sent_emb_model']:
             from openai import OpenAI
             client = OpenAI(api_key=self.config['openai_api_key'])

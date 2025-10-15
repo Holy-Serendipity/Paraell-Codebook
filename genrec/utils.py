@@ -464,9 +464,11 @@ def init_device():
     import torch
     use_ddp = True if os.environ.get("WORLD_SIZE") else False # Check if DDP is enabled
     if torch.cuda.is_available():
-        return torch.device('cuda'), use_ddp
+        # return torch.device('cuda'), use_ddp
+        return "cuda", use_ddp
     else:
-        return torch.device('cpu'), use_ddp
+        # return torch.device('cpu'), use_ddp
+        return "cpu", use_ddp
 
 def config_for_log(config: dict) -> dict:
     config = config.copy()

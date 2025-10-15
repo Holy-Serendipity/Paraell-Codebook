@@ -1,8 +1,8 @@
 num_proc: 1
-cache_dir: cache/       # Usually for raw and processed data
-log_dir: logs/
-tensorboard_log_dir: tensorboard/
-ckpt_dir: ckpt/
+cache_dir: /data/cache/       # Usually for raw and processed data
+log_dir: /root/logs/
+tensorboard_log_dir: /output/tensorboard/
+ckpt_dir: /output/ckpt/
 run_id: genrec_default  # Change this to your customized run id
 rand_seed: 2024
 reproducibility: True

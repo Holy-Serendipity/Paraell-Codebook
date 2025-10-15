@@ -3,9 +3,9 @@ metadata: sentence
 
 # Config the sentence embedding model
 #   Sentence T5
-sent_emb_model: /root/lee/models/sentence-t5-base
-sent_emb_dim: 768
-sent_emb_pca: 128
+sent_emb_model: /root/lee/models/bge-m3
+sent_emb_dim: 1024
+sent_emb_pca: 256
 #   OpenAI Embedding Model
 #sent_emb_model: text-embedding-3-large
 #sent_emb_dim: 3072
