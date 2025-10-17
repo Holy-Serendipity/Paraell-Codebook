@@ -125,7 +125,7 @@ class RPGTokenizer(AbstractTokenizer):
                 devices=self.config['device']
             )
             encoding_config={
-                'batch_size': self.config['sent_emb_dim'],
+                'batch_size': self.config['sent_emb_batch_size'],
                 'max_length': 8192,
                 'return_dense':True,
                 'return_sparse':False,
@@ -294,13 +294,13 @@ class RPGTokenizer(AbstractTokenizer):
             else:
                 self.log(f'[TOKENIZER] Encoding sentence embeddings...')
                 sent_embs = self._encode_sent_emb(dataset, sent_emb_path)
-            # PCA
-            if self.config['sent_emb_pca'] > 0:
-                self.log(f'[TOKENIZER] Applying PCA to sentence embeddings...')
-                from sklearn.decomposition import PCA
-                pca = PCA(n_components=self.config['sent_emb_pca'], whiten=True)
-                sent_embs = pca.fit_transform(sent_embs)
-            self.log(f'[TOKENIZER] Sentence embeddings shape: {sent_embs.shape}')
+                # PCA
+                if self.config['sent_emb_pca'] > 0:
+                    self.log(f'[TOKENIZER] Applying PCA to sentence embeddings...')
+                    from sklearn.decomposition import PCA
+                    pca = PCA(n_components=self.config['sent_emb_pca'], whiten=True)
+                    sent_embs = pca.fit_transform(sent_embs)
+                self.log(f'[TOKENIZER] Sentence embeddings shape: {sent_embs.shape}')
 
             # Generate semantic IDs
             training_item_mask = self._get_items_for_training(dataset)
