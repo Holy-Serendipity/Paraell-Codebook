@@ -10,7 +10,8 @@ import json
 import numpy as np
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
-
+import faiss
+import faiss.contrib.torch
 from genrec.dataset import AbstractDataset
 from genrec.tokenizer import AbstractTokenizer
 from FlagEmbedding import BGEM3FlagModel
@@ -124,7 +125,7 @@ class RPGTokenizer(AbstractTokenizer):
                 devices=self.config['device']
             )
             encoding_config={
-                'batch_size': self.config['sent_emb_batch_size'],
+                'batch_size': self.config['sent_emb_dim'],
                 'max_length': 8192,
                 'return_dense':True,
                 'return_sparse':False,
@@ -204,7 +205,6 @@ class RPGTokenizer(AbstractTokenizer):
             sem_ids_path (str): Path to save the generated semantic IDs.
             train_mask (numpy.ndarray): Boolean mask indicating the training samples.
         """
-        import faiss
         if self.config['opq_use_gpu']:
             res = faiss.StandardGpuResources()
             res.setTempMemory(1024 * 1024 * 512)
@@ -290,7 +290,7 @@ class RPGTokenizer(AbstractTokenizer):
             )
             if os.path.exists(sent_emb_path):
                 self.log(f'[TOKENIZER] Loading sentence embeddings from {sent_emb_path}...')
-                sent_embs = np.fromfile(sent_emb_path, dtype=np.float32).reshape(-1, self.config['sent_emb_dim'])
+                sent_embs = np.fromfile(sent_emb_path, dtype=np.float32).reshape(-1, self.config['sent_emb_pca'])
             else:
                 self.log(f'[TOKENIZER] Encoding sentence embeddings...')
                 sent_embs = self._encode_sent_emb(dataset, sent_emb_path)

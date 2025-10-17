@@ -2,6 +2,10 @@ num_proc: 1
 cache_dir: /data/cache/       # Usually for raw and processed data
 log_dir: /root/logs/
 tensorboard_log_dir: /output/tensorboard/
+wandb_project: 'rpg'
+wandb_entity: 'le2047329-zhejiang-university'
+#wandb_run_name: 'rpg-bge'
+wandb_mode: 'online'
 ckpt_dir: /output/ckpt/
 run_id: genrec_default  # Change this to your customized run id
 rand_seed: 2024
@@ -10,7 +14,7 @@ reproducibility: True
 train_batch_size: 256
 eval_batch_size: 32
 lr: 0.0003
-weight_decay: 0.0
+weight_decay: 1e-4
 warmup_steps: 10000
 steps: ~
 epochs: 150

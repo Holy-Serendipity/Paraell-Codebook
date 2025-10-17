@@ -14,6 +14,7 @@ import hashlib
 import datetime
 import requests
 import tiktoken
+import torch
 from typing import Union, Optional
 import logging
 from logging import getLogger
@@ -56,12 +57,17 @@ def get_local_time():
         str: current time
     """
     cur = datetime.datetime.now()
-    cur = cur.strftime("%b-%d-%Y_%H-%M")
+    cur = cur.strftime("%b-%d-%Y_%H-%M-%S")
     return cur
 
 
 def get_command_line_args_str():
-    return '_'.join(sys.argv).replace('/', '|')
+    args = sys.argv
+    for i,arg in enumerate(args):
+        if arg == '--category' and i+1 < len(args):
+            return args[i+1]
+    return 'default_category'
+    # return '_'.join(sys.argv).replace('/', '|')
 
 
 def get_file_name(config: dict, suffix: str = ''):

@@ -20,7 +20,7 @@ from genrec.tokenizer import AbstractTokenizer
 from genrec.evaluator import Evaluator
 from genrec.utils import get_file_name, get_total_steps, config_for_log, log
 
-
+import wandb
 class Trainer:
     """
     A class that handles the training process for a model.
@@ -97,6 +97,14 @@ class Trainer:
         best_epoch = 0
         best_val_score = -1
 
+        # 记录训练开始信息
+        if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+            wandb.log({
+                'info/training_started': 1,
+                'training/total_epochs': n_epochs,
+                'training/total_steps': total_n_steps
+            })
+
         for epoch in range(n_epochs):
             # Training
             self.model.train()
@@ -106,7 +114,11 @@ class Trainer:
                 total=len(train_dataloader),
                 desc=f"Training - [Epoch {epoch + 1}]",
             )
-            for batch in train_progress_bar:
+
+            # 记录学习率
+            current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else self.config['lr']
+
+            for batch_idx, batch in enumerate(train_progress_bar):
                 optimizer.zero_grad()
                 outputs = self.model(batch)
                 loss = outputs.loss
@@ -117,7 +129,28 @@ class Trainer:
                 scheduler.step()
                 total_loss = total_loss + loss.item()
 
-            self.accelerator.log({"Loss/train_loss": total_loss / len(train_dataloader)}, step=epoch + 1)
+                # 记录批次级别的指标（可选，避免太频繁）
+                if batch_idx % 100 == 0 and self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                    wandb.log({
+                        'batch/loss': loss.item(),
+                        'batch/lr': current_lr,
+                        'batch/step': epoch * len(train_dataloader) + batch_idx
+                    })
+            avg_train_loss = total_loss / len(train_dataloader)
+            self.accelerator.log({
+                "Loss/train_loss": avg_train_loss,
+                "LearningRate/lr": current_lr
+            }, step=epoch + 1)
+
+            # 记录到 wandb
+            if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                wandb.log({
+                    'epoch': epoch + 1,
+                    'train/loss': avg_train_loss,
+                    'train/learning_rate': current_lr,
+                    'train/epoch_progress': (epoch + 1) / n_epochs
+                })
+
             self.log(f'[Epoch {epoch + 1}] Train Loss: {total_loss / len(train_dataloader)}')
 
             # Evaluation
@@ -126,22 +159,57 @@ class Trainer:
                 if self.accelerator.is_main_process:
                     for key in all_results:
                         self.accelerator.log({f"Val_Metric/{key}": all_results[key]}, step=epoch + 1)
+                    # 记录到 wandb
+                    if hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                        wandb_log_data = {'epoch': epoch + 1}
+                        for key, value in all_results.items():
+                            wandb_log_data[f'val/{key}'] = value
+                        wandb.log(wandb_log_data)
                     self.log(f'[Epoch {epoch + 1}] Val Results: {all_results}')
                 val_score = all_results[self.config['val_metric']]
                 if val_score > best_val_score:
                     best_val_score = val_score
                     best_epoch = epoch + 1
+
+                    # 记录最佳结果到 wandb
+                    if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get(
+                            'wandb_run'):
+                        wandb.log({
+                            'best/val_score': best_val_score,
+                            'best/epoch': best_epoch
+                        })
+
                     if self.accelerator.is_main_process:
                         if self.config['use_ddp']: # unwrap model for saving
                             unwrapped_model = self.accelerator.unwrap_model(self.model)
                             torch.save(unwrapped_model.state_dict(), self.saved_model_ckpt)
                         else:
                             torch.save(self.model.state_dict(), self.saved_model_ckpt)
+
+                        # 记录模型保存到 wandb
+                        if hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                            wandb.log({'info/model_saved': 1})
+
                         self.log(f'[Epoch {epoch + 1}] Saved model checkpoint to {self.saved_model_ckpt}')
 
                 if self.config['patience'] is not None and epoch + 1 - best_epoch >= self.config['patience']:
                     self.log(f'Early stopping at epoch {epoch + 1}')
+
+                    # 记录早停信息到 wandb
+                    if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get(
+                            'wandb_run'):
+                        wandb.log({'info/early_stopping': epoch + 1})
+
                     break
+
+        # 记录训练完成信息
+        if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+            wandb.log({
+                'info/training_completed': 1,
+                'best/final_val_score': best_val_score,
+                'best/final_epoch': best_epoch
+            })
+
         self.log(f'Best epoch: {best_epoch}, Best val score: {best_val_score}')
         return best_epoch, best_val_score
 
@@ -189,6 +257,11 @@ class Trainer:
                 key = f"{metric}@{k}"
                 output_results[key] = torch.cat(all_results[key]).mean().item()
         output_results['n_visited_items'] = torch.cat(all_results['n_visited_items']).mean().item()
+
+        # 记录评估完成
+        if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+            wandb.log({f'info/{split}_evaluation_completed': 1})
+
         return output_results
 
     def case_evaluate(self, dataloader, split='test'):
