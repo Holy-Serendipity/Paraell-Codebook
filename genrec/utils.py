@@ -62,12 +62,15 @@ def get_local_time():
 
 
 def get_command_line_args_str():
-    args = sys.argv
-    for i,arg in enumerate(args):
-        if arg == '--category' and i+1 < len(args):
-            return args[i+1]
+    for i, arg in enumerate(sys.argv):
+        # 处理 --category=value 格式
+        if arg.startswith('--category='):
+            return arg.split('=', 1)[1]
+        # 处理 --category value 格式
+        elif arg == '--category' and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+
     return 'default_category'
-    # return '_'.join(sys.argv).replace('/', '|')
 
 
 def get_file_name(config: dict, suffix: str = ''):
