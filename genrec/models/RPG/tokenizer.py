@@ -137,7 +137,17 @@ class RPGTokenizer(AbstractTokenizer):
             )
 
             sent_embs = encode_results['dense_vecs']
-
+        elif 'Qwen' in self.config['sent_emb_model']:
+            sent_emb_model = SentenceTransformer(
+                self.config['sent_emb_model']
+            ).to(self.config['device'])
+            sent_embs = sent_emb_model.encode(
+                meta_sentences,
+                convert_to_numpy=True,
+                batch_size=self.config['sent_emb_batch_size'],
+                show_progress_bar=True,
+                device=self.config['device'],
+            )
         elif 'text-embedding-3' in self.config['sent_emb_model']:
             from openai import OpenAI
             client = OpenAI(api_key=self.config['openai_api_key'])

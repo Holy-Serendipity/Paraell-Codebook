@@ -3,15 +3,18 @@ metadata: sentence
 
 # Config the sentence embedding model
 #   Sentence T5
-sent_emb_model: /root/lee/models/bge-m3
-sent_emb_dim: 1024
-sent_emb_pca: 512
+#sent_emb_model: /root/lee/models/bge-m3
+#sent_emb_dim: 1024
+#sent_emb_pca: 512
 #   OpenAI Embedding Model
 #sent_emb_model: text-embedding-3-large
 #sent_emb_dim: 3072
 #sent_emb_pca: 512
 #openai_api_key: ~
-
+#   Qwen3-Embedding
+sent_emb_model: /root/lee/models/Qwen3-Embedding-8B
+sent_emb_dim: 4096
+sent_emb_pca: 512
 sent_emb_batch_size: 512
 
 # Config for the backbone model
