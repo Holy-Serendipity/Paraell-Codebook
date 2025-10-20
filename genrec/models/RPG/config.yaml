@@ -12,8 +12,8 @@ metadata: sentence
 #sent_emb_pca: 512
 #openai_api_key: ~
 #   Qwen3-Embedding
-sent_emb_model: /root/lee/models/Qwen3-Embedding-8B
-sent_emb_dim: 4096
+sent_emb_model: /root/lee/models/Qwen3-Embedding-4B
+sent_emb_dim: 2560
 sent_emb_pca: 512
 sent_emb_batch_size: 512
 
