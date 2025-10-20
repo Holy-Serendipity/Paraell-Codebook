@@ -15,7 +15,7 @@ import faiss.contrib.torch
 from genrec.dataset import AbstractDataset
 from genrec.tokenizer import AbstractTokenizer
 from FlagEmbedding import BGEM3FlagModel
-
+import torch
 class RPGTokenizer(AbstractTokenizer):
     """
     An example when "codebook_size == 256, n_codebooks == 32":
@@ -138,15 +138,42 @@ class RPGTokenizer(AbstractTokenizer):
 
             sent_embs = encode_results['dense_vecs']
         elif 'Qwen' in self.config['sent_emb_model']:
-            sent_emb_model = SentenceTransformer(
-                self.config['sent_emb_model']
-            ).to(self.config['device'])
+            device, use_ddp = self.config['device'], self.config['use_ddp']
+            print(f"使用设备: {device}, DDP模式: {use_ddp}")
+            # 根据是否使用DDP调整设备设置
+            if use_ddp:
+                # DDP模式下，让SentenceTransformers自动处理
+                sent_emb_model = SentenceTransformer(
+                    self.config['sent_emb_model'],
+                    device="cpu",  # 先加载到CPU，DDP会自动分配到GPU
+                    trust_remote_code=True
+                )
+            else:
+                # 非DDP模式，直接指定设备
+                sent_emb_model = SentenceTransformer(
+                    self.config['sent_emb_model'],
+                    device=device,
+                    trust_remote_code=True
+                )
+
+            # 多GPU优化
+            num_gpus = torch.cuda.device_count() if device == "cuda" else 0
+            if num_gpus > 1 and not use_ddp:
+                print(f"检测到 {num_gpus} 个GPU，启用数据并行")
+                # 调整批处理大小
+                optimal_batch_size = self.config['sent_emb_batch_size'] * num_gpus
+            else:
+                optimal_batch_size = self.config['sent_emb_batch_size']
+            # sent_emb_model = SentenceTransformer(
+            #     self.config['sent_emb_model']
+            # ).to(self.config['device'])
             sent_embs = sent_emb_model.encode(
                 meta_sentences,
-                convert_to_numpy=True,
-                batch_size=self.config['sent_emb_batch_size'],
+                max_seq_length=8192,
+                convert_to_tensor=False,
+                batch_size=optimal_batch_size,
                 show_progress_bar=True,
-                device=self.config['device'],
+                normalize_embeddings=True
             )
         elif 'text-embedding-3' in self.config['sent_emb_model']:
             from openai import OpenAI
