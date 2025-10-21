@@ -138,6 +138,8 @@ class RPGTokenizer(AbstractTokenizer):
 
             sent_embs = encode_results['dense_vecs']
         elif 'Qwen' in self.config['sent_emb_model']:
+            self.log(f"开始编码 {len(meta_sentences)} 个句子")
+            self.log(f"batch_size: {self.config['sent_emb_batch_size']}")
             sent_emb_model = SentenceTransformer(
                 self.config['sent_emb_model']
             ).to(self.config['device'])
@@ -148,6 +150,13 @@ class RPGTokenizer(AbstractTokenizer):
                 show_progress_bar=True,
                 device=self.config['device'],
             )
+            self.log(f"编码完成，输出形状: {sent_embs.shape}")
+            self.log(f"输入句子数: {len(meta_sentences)}")
+            self.log(f"输出嵌入数: {sent_embs.shape[0]}")
+
+            # 确保一致性
+            if len(meta_sentences) != sent_embs.shape[0]:
+                self.log("警告: 输入输出数量不匹配!")
         elif 'text-embedding-3' in self.config['sent_emb_model']:
             from openai import OpenAI
             client = OpenAI(api_key=self.config['openai_api_key'])

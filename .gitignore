@@ -5,3 +5,4 @@
 /logs/
 /cache/
 /wandb/
+/requirements.txt
