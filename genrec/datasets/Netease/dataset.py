@@ -109,6 +109,10 @@ class Netease(AbstractDataset):
         Returns:
             all_item_seqs (dict): 重新映射后的用户-物品序列
             id_mapping (dict): 包含原始ID和重新映射ID之间映射的字典
+                - user2id (dict): A dictionary mapping raw user IDs to remapped user IDs.
+                - item2id (dict): A dictionary mapping raw item IDs to remapped item IDs.
+                - id2user (list): A list mapping remapped user IDs to raw user IDs.
+                - id2item (list): A list mapping remapped item IDs to raw item IDs.
         """
         self.log('Remapping user and item IDs...')
         for user, items in item_seqs.items():
@@ -119,7 +123,7 @@ class Netease(AbstractDataset):
 
             # 映射物品ID
             mapped_items = []
-            for item_id, timestamp in items:
+            for item_id, _ in items:
                 if item_id not in self.id_mapping['item2id']:
                     self.id_mapping['item2id'][item_id] = len(self.id_mapping['id2item'])
                     self.id_mapping['id2item'].append(item_id)
@@ -140,7 +144,8 @@ class Netease(AbstractDataset):
                 id_mapping = json.load(f)
             return mapped_item_seqs, id_mapping
         self.log('[Dataset] Processing likes seqs...')
-        item_seqs = self.load_likes(input_path, sort_method='time')
+        input_file=os.path.join(input_path, "data_likes.csv")
+        item_seqs = self.load_likes(input_file, sort_method='time')
         item_seqs_filtered = self.advanced_filter(
             item_seqs,
             min_interactions=3,
@@ -148,8 +153,8 @@ class Netease(AbstractDataset):
             min_time_range=None,
         )
         mapped_item_seqs, id_mapping = self.remap_ids(item_seqs_filtered)
-        self.save_to_json(mapped_item_seqs, os.path.join(output_path+"all_item_seqs.json"))
-        self.save_to_json(id_mapping, os.path.join(output_path+"id_mapping.json"))
+        self.save_to_json(mapped_item_seqs, os.path.join(output_path,"all_item_seqs.json"))
+        self.save_to_json(id_mapping, os.path.join(output_path,"id_mapping.json"))
         total_interactions = sum(len(items) for items in item_seqs_filtered.values())
         self.log(f"处理完成！最终数据: {len(item_seqs_filtered):,} 用户, {total_interactions:,} 交互")
         return mapped_item_seqs, id_mapping
@@ -240,6 +245,7 @@ class Netease(AbstractDataset):
 
     def process_meta(self, input_path:str, output_path:str)->Optional[dict]:
         process_mode = self.config['metadata']
+        input_file = os.path.join(input_path, 'data_items.csv')
         meta_file = os.path.join(output_path, f'metadata.{process_mode}.json')
         if os.path.exists(meta_file):
             self.log('[Dataset] Meta data has been processed...')
@@ -250,8 +256,8 @@ class Netease(AbstractDataset):
             return None
         if process_mode=='sentence':
             item2meta = self.process_metadata(
-                input_csv=input_path,
-                output_json=output_path,
+                input_csv=input_file,
+                output_json=meta_file,
                 item2id=self.item2id
             )
             self.save_to_json(item2meta, meta_file)
