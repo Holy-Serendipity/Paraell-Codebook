@@ -5,3 +5,4 @@
 # LICENSE file in the root directory of this source tree.
 
 from genrec.datasets.AmazonReviews2014.dataset import AmazonReviews2014
+from genrec.datasets.Netease.dataset import Netease
