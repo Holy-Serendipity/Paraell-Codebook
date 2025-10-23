@@ -125,7 +125,7 @@ class Netease(AbstractDataset):
             mapped_items = []
             for item_id, _ in items:
                 if item_id not in self.id_mapping['item2id']:
-                    self.id_mapping['item2id'][item_id] = len(self.id_mapping['id2item'])
+                    self.id_mapping['item2id'][str(item_id)] = len(self.id_mapping['id2item'])
                     self.id_mapping['id2item'].append(str(item_id))
                 mapped_items.append(str(item_id))
 
