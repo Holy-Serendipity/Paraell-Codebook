@@ -118,16 +118,16 @@ class Netease(AbstractDataset):
         for user, items in item_seqs.items():
             # 映射用户ID
             if user not in self.id_mapping['user2id']:
-                self.id_mapping['user2id'][user] = len(self.id_mapping['id2user'])
-                self.id_mapping['id2user'].append(user)
+                self.id_mapping['user2id'][str(user)] = len(self.id_mapping['id2user'])
+                self.id_mapping['id2user'].append(str(user))
 
             # 映射物品ID
             mapped_items = []
             for item_id, _ in items:
                 if item_id not in self.id_mapping['item2id']:
                     self.id_mapping['item2id'][item_id] = len(self.id_mapping['id2item'])
-                    self.id_mapping['id2item'].append(item_id)
-                mapped_items.append(item_id)
+                    self.id_mapping['id2item'].append(str(item_id))
+                mapped_items.append(str(item_id))
 
             # 存储映射后的序列
             self.all_item_seqs[user] = mapped_items
@@ -223,7 +223,7 @@ class Netease(AbstractDataset):
                 for row in tqdm(reader, total=total_lines, desc="speed", unit="row"):
                     if len(row) >= 3:
                         # 获取第一个字段作为key
-                        key = row[0].strip()
+                        key = str(row[0].strip())
                         if key not in item_ids:
                             continue
                         # 获取并清理第三个字段作为value
@@ -261,6 +261,7 @@ class Netease(AbstractDataset):
                 item2id=self.item2id
             )
             self.save_to_json(item2meta, meta_file)
+            self.log(f"结果已保存到: {meta_file}")
         else:
             raise NotImplementedError('Metadata processing type not implemented.')
         return item2meta
