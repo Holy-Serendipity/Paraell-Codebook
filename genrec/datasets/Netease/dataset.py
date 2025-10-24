@@ -117,20 +117,20 @@ class Netease(AbstractDataset):
         self.log('Remapping user and item IDs...')
         for user, items in item_seqs.items():
             # 映射用户ID
-            if user not in self.id_mapping['user2id']:
+            if str(user) not in self.id_mapping['user2id']:
                 self.id_mapping['user2id'][str(user)] = len(self.id_mapping['id2user'])
                 self.id_mapping['id2user'].append(str(user))
 
             # 映射物品ID
             mapped_items = []
             for item_id, _ in items:
-                if item_id not in self.id_mapping['item2id']:
+                if str(item_id) not in self.id_mapping['item2id']:
                     self.id_mapping['item2id'][str(item_id)] = len(self.id_mapping['id2item'])
                     self.id_mapping['id2item'].append(str(item_id))
                 mapped_items.append(str(item_id))
 
             # 存储映射后的序列
-            self.all_item_seqs[user] = mapped_items
+            self.all_item_seqs[str(user)] = mapped_items
 
         return self.all_item_seqs, self.id_mapping
     def process_likes(self, input_path:str, output_path:str)->tuple[dict,dict]:
@@ -233,8 +233,6 @@ class Netease(AbstractDataset):
                         result_dict[key] = value
 
             self.log(f"处理完成！共处理 {len(result_dict)} 条数据")
-            self.log(f"结果已保存到: {output_json}")
-
             return result_dict
         except FileNotFoundError:
             self.log(f"错误: 找不到文件 {input_csv}")
