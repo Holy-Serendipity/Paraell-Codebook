@@ -23,7 +23,7 @@ from genrec.model import AbstractModel
 from genrec.dataset import AbstractDataset
 from accelerate.utils import set_seed
 
-
+from html import unescape
 def init_seed(seed, reproducibility):
     r"""init random seed for random functions in numpy, torch, cuda and cudnn
 
@@ -462,6 +462,33 @@ def clean_text(raw_text: str) -> str:
     text=re.sub(r'[^\x00-\x7F]', ' ', text)
     return text
 
+def clean_text_netease(rawtext):
+    """
+    清理文本：移除HTML标签、特殊字符和多余空格
+    """
+    if not rawtext:
+        return rawtext
+
+    # 1. 移除HTML标签
+    text = list_to_str(rawtext)
+    text = re.sub(r'<[^>]+>', '', text)
+
+    # 2. 转换HTML实体（如 &quot; -> "）
+    text = unescape(text)
+
+    # 3. 移除所有引号（单引号和双引号）
+    text = re.sub(r'[\'"]', '', text)
+    # 4. 移除多余的空格和换行符
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # 5. 移除JSON字符串中的转义引号（可选，根据需求）
+    text = text.replace('\\"', '').replace("\\'", '')
+
+    # 6. 移除其他特殊字符（保留基本的标点符号）
+    # 保留中文、英文、数字、基本标点符号
+    text = re.sub(r'[^\w\u4e00-\u9fff\s\.\,\!\?\;:\-\#\(\)\"\']', '', text)
+
+    return text
 def init_device():
     """
     Set the visible devices for training. Supports multiple GPUs.

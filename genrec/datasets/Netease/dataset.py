@@ -1,5 +1,4 @@
 import os
-import gzip
 import json
 from tqdm import tqdm
 from collections import defaultdict
@@ -7,7 +6,7 @@ import numpy as np
 from typing import Optional,Union
 import pandas as pd
 from genrec.dataset import AbstractDataset
-from genrec.utils import download_file, clean_text
+from genrec.utils import clean_text_netease
 from datetime import datetime
 import re
 import csv
@@ -227,7 +226,7 @@ class Netease(AbstractDataset):
                         if key not in item_ids:
                             continue
                         # 获取并清理第三个字段作为value
-                        value = clean_text(row[1] + '.' + row[2])
+                        value = clean_text_netease(row[1] + '.' + row[2])
 
                         # 添加到结果字典
                         result_dict[key] = value
