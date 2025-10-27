@@ -162,8 +162,11 @@ class RPG(AbstractModel):
         # 3) Convert [-1, 1] to [0, 1] range
         token_sims_01 = 0.5 * (token_sims + 1.0)  # shape: (32, 256, 256)
 
+        indices=[]
+        values=[]
+        threshold=0.6 # 只存储显著非零值
         # 4) Prepare an output similarity matrix
-        item_item_sim = torch.zeros((n_items, n_items), device=self.gpt2.device, dtype=torch.float32)
+        # item_item_sim = torch.zeros((n_items, n_items), device=self.gpt2.device, dtype=torch.float32)
 
         # 5) Fill the item-item matrix in chunks
         for i_start in range(1, n_items, self.chunk_size):
@@ -212,10 +215,26 @@ class RPG(AbstractModel):
                 # Now take the average across the 32 digits
                 avg_block = sum_block / n_digit
 
-                # Write back into the final item_item_sim
-                item_item_sim[i_start:i_end, j_start:j_end] = avg_block
-
-        return item_item_sim
+                mask=avg_block < threshold
+                i_indices,j_indices = torch.nonzero(mask)
+                global_i=i_start+i_indices
+                global_j=j_start+j_indices
+                sim_values=avg_block[mask]
+                for idx in range(len(global_i)):
+                    indices.append([global_i[idx].item(),global_j[idx].item()])
+                    values.append(sim_values[idx].item())
+            if indices:
+                indices = torch.tensor(indices, device=self.gpt2.device).t()
+                values = torch.tensor(values, device=self.gpt2.device)
+                return torch.sparse_coo_tensor(indices, values, (n_items, n_items))
+            else:
+                return torch.sparse_coo_tensor(torch.empty((2,0),dtype=torch.long),
+                                               torch.empty(0),
+                                               size=(n_items, n_items))
+        #         # Write back into the final item_item_sim
+        #         item_item_sim[i_start:i_end, j_start:j_end] = avg_block
+        #
+        # return item_item_sim
 
     def build_adjacency_list(self, item_item_sim):
         return torch.topk(item_item_sim, k=self.n_edges, dim=-1).indices
