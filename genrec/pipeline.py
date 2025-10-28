@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 from logging import getLogger
 from typing import Union
 import torch
@@ -166,10 +160,6 @@ class Pipeline:
         best_epoch, best_val_score = self.trainer.fit(train_dataloader, val_dataloader)
 
         if self.accelerator.is_main_process and self.config.get('wandb_run'):
-            wandb.log({
-                'best/epoch': best_epoch,
-                'best/val_score': best_val_score
-            })
             # 保存到 wandb 的摘要
             wandb.run.summary["best_epoch"] = best_epoch
             wandb.run.summary["best_val_score"] = best_val_score

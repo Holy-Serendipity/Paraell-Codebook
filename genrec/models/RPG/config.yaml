@@ -3,7 +3,7 @@ metadata: sentence
 
 # Config the sentence embedding model
 #   Sentence T5
-#sent_emb_model: /root/lee/models/bge-m3
+#sent_emb_model: /root/parade/models/bge-m3
 #sent_emb_dim: 1024
 #sent_emb_pca: 512
 #   OpenAI Embedding Model

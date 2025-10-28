@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -215,23 +209,23 @@ class RPG(AbstractModel):
                 # Now take the average across the 32 digits
                 avg_block = sum_block / n_digit
 
-                mask=avg_block < threshold
-                i_indices,j_indices = torch.nonzero(mask)
+                mask=avg_block > threshold
+                i_indices,j_indices = torch.where(mask)
                 global_i=i_start+i_indices
                 global_j=j_start+j_indices
                 sim_values=avg_block[mask]
                 for idx in range(len(global_i)):
                     indices.append([global_i[idx].item(),global_j[idx].item()])
                     values.append(sim_values[idx].item())
-            if indices:
-                indices = torch.tensor(indices, device=self.gpt2.device).t()
-                values = torch.tensor(values, device=self.gpt2.device)
-                return torch.sparse_coo_tensor(indices, values, (n_items, n_items))
-            else:
-                return torch.sparse_coo_tensor(torch.empty((2,0),dtype=torch.long),
-                                               torch.empty(0),
-                                               size=(n_items, n_items))
-        #         # Write back into the final item_item_sim
+        if indices:
+            indices = torch.tensor(indices, device=self.gpt2.device).t()
+            values = torch.tensor(values, device=self.gpt2.device)
+            return torch.sparse_coo_tensor(indices, values, (n_items, n_items))
+        else:
+            return torch.sparse_coo_tensor(torch.empty((2,0),dtype=torch.long),
+                                           torch.empty(0),
+                                           size=(n_items, n_items))
+                # Write back into the final item_item_sim
         #         item_item_sim[i_start:i_end, j_start:j_end] = avg_block
         #
         # return item_item_sim
