@@ -92,7 +92,7 @@ class Trainer:
         best_val_score = -1
 
         # 记录训练开始信息
-        if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+        if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
             wandb.log({
                 'info/training_started': 1,
                 'training/total_epochs': n_epochs,
@@ -143,7 +143,7 @@ class Trainer:
                 total_loss = total_loss + loss.item()
 
                 # 记录批次级别的指标（可选，避免太频繁）
-                if batch_idx % 100 == 0 and self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                if batch_idx % 100 == 0 and self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
                     wandb.log({
                         'batch/loss': loss.item(),
                         'batch/lr': current_lr,
@@ -163,7 +163,7 @@ class Trainer:
             }, step=epoch + 1)
 
             # 记录到 wandb
-            if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+            if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
                 wandb.log({
                     'epoch': epoch + 1,
                     'train/loss': avg_train_loss,
@@ -182,7 +182,7 @@ class Trainer:
                     for key in all_results:
                         self.accelerator.log({f"Val_Metric/{key}": all_results[key]}, step=epoch + 1)
                     # 记录到 wandb
-                    if hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                    if 'wandb_run' in self.config and self.config.get('wandb_run'):
                         wandb_log_data = {'epoch': epoch + 1}
                         for key, value in all_results.items():
                             wandb_log_data[f'val/{key}'] = value
@@ -194,7 +194,7 @@ class Trainer:
                     best_epoch = epoch + 1
 
                     # 记录最佳结果到 wandb
-                    if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get(
+                    if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get(
                             'wandb_run'):
                         wandb.log({
                             'best/val_score': best_val_score,
@@ -209,7 +209,7 @@ class Trainer:
                             torch.save(self.model.state_dict(), self.saved_model_ckpt)
 
                         # 记录模型保存到 wandb
-                        if hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                        if 'wandb_run' in self.config and self.config.get('wandb_run'):
                             wandb.log({'info/model_saved': 1})
 
                         self.log(f'[Epoch {epoch + 1}] Saved model checkpoint to {self.saved_model_ckpt}')
@@ -218,14 +218,14 @@ class Trainer:
                     self.log(f'Early stopping at epoch {epoch + 1}')
 
                     # 记录早停信息到 wandb
-                    if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get(
+                    if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get(
                             'wandb_run'):
                         wandb.log({'info/early_stopping': epoch + 1})
 
                     break
 
         # 记录训练完成信息
-        if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+        if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
             wandb.log({
                 'info/training_completed': 1,
                 'best/final_val_score': best_val_score,
@@ -281,7 +281,7 @@ class Trainer:
         output_results['n_visited_items'] = torch.cat(all_results['n_visited_items']).mean().item()
 
         # 记录评估完成
-        if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+        if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
             wandb.log({f'info/{split}_evaluation_completed': 1})
 
         return output_results
