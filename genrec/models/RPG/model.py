@@ -103,9 +103,9 @@ class RPG(AbstractModel):
     def n_parameters(self) -> str:
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         emb_params = sum(p.numel() for p in self.gpt2.get_input_embeddings().parameters() if p.requires_grad)
-        return f'#Embedding parameters: {emb_params}\n' \
-                f'#Non-embedding parameters: {total_params - emb_params}\n' \
-                f'#Total trainable parameters: {total_params}\n'
+        return f'Embedding parameters: {emb_params}\n' \
+                f'Non-embedding parameters: {total_params - emb_params}\n' \
+                f'Total trainable parameters: {total_params}\n'
 
     def forward(self, batch: dict, return_loss=True) -> torch.Tensor:
         input_tokens = self.item_id2tokens[batch['input_ids']]
