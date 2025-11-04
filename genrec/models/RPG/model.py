@@ -209,7 +209,7 @@ class RPG(AbstractModel):
                 # Now take the average across the 32 digits
                 avg_block = sum_block / n_digit
 
-                mask=avg_block > threshold
+                mask=(avg_block > threshold) & (torch.arange(block_size_i).unsqueeze(1) <= torch.arange(block_size_j).unsqueeze(0))
                 i_indices,j_indices = torch.where(mask)
                 global_i=i_start+i_indices
                 global_j=j_start+j_indices
