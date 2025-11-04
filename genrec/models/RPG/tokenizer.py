@@ -291,14 +291,14 @@ class RPGTokenizer(AbstractTokenizer):
         """
         # Load semantic IDs
         sem_ids_path = os.path.join(
-            dataset.cache_dir, 'processed', f'{self.config["n_codebook"]}*{self.n_codebook_bits}',
+            dataset.cache_dir, 'processed', f'{self.config["n_codebook"]}-{self.n_codebook_bits}',
             f'{os.path.basename(self.config["sent_emb_model"])}_{self.index_factory}.sem_ids'
         )
 
         if not os.path.exists(sem_ids_path):
             # Load or encode sentence embeddings
             sent_emb_path = os.path.join(
-                dataset.cache_dir, 'processed', f'{self.config["n_codebook"]}*{self.n_codebook_bits}',
+                dataset.cache_dir, 'processed', f'{self.config["n_codebook"]}-{self.n_codebook_bits}',
                 f'{os.path.basename(self.config["sent_emb_model"])}.sent_emb'
             )
             if os.path.exists(sent_emb_path):
