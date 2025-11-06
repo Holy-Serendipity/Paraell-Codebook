@@ -136,6 +136,10 @@ class RPG(AbstractModel):
         return outputs
 
     def build_ii_sim_mat(self):
+
+        # 获取模型所在的设备
+        device = next(self.parameters()).device
+
         # Assuming n_digit=32, codebook_size=256
         n_items = self.dataset.n_items
         n_digit = self.tokenizer.n_digit
@@ -209,7 +213,7 @@ class RPG(AbstractModel):
                 # Now take the average across the 32 digits
                 avg_block = sum_block / n_digit
 
-                mask=(avg_block > threshold) & (torch.arange(block_size_i).unsqueeze(1) <= torch.arange(block_size_j).unsqueeze(0))
+                mask=(avg_block > threshold) & (torch.arange(block_size_i, device=device).unsqueeze(1) <= torch.arange(block_size_j,device=device).unsqueeze(0))
                 i_indices,j_indices = torch.where(mask)
                 global_i=i_start+i_indices
                 global_j=j_start+j_indices
