@@ -162,7 +162,7 @@ class RPG(AbstractModel):
 
         indices=[]
         values=[]
-        threshold=0.6 # 只存储显著非零值
+        threshold=0.5 # 只存储显著非零值
         # 4) Prepare an output similarity matrix
         # item_item_sim = torch.zeros((n_items, n_items), device=self.gpt2.device, dtype=torch.float32)
 
@@ -235,7 +235,11 @@ class RPG(AbstractModel):
         # return item_item_sim
 
     def build_adjacency_list(self, item_item_sim):
-        return torch.topk(item_item_sim, k=self.n_edges, dim=-1).indices
+        if item_item_sim.is_sparse:
+            item_item_sim_dense=item_item_sim.todense()
+        else:
+            item_item_sim_dense = item_item_sim
+        return torch.topk(item_item_sim_dense, k=self.n_edges, dim=-1).indices
 
     def init_graph(self):
         self.tokenizer.log("Building item-item similarity matrix...")

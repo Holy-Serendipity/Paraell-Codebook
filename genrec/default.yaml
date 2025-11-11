@@ -2,7 +2,7 @@ num_proc: 1
 cache_dir: /data/cache/       # Usually for raw and processed data
 log_dir: /data/logs/
 tensorboard_log_dir: /output/tensorboard/
-wandb_project: 'rpg'
+wandb_project: 'RPG-Netease'
 wandb_entity: 'le2047329-zhejiang-university'
 #wandb_run_name: 'rpg-bge'
 wandb_mode: 'online'
