@@ -135,16 +135,16 @@ class RPG(AbstractModel):
             outputs.loss = torch.mean(torch.stack(losses))
         return outputs
 
-    def build_ii_sim_mat(self):
+    def build_ii_sim_mat(self, threshold=0.5, use_half=False):
 
         # 获取模型所在的设备
-        device = next(self.parameters()).device
+        device = self.gpt2.device if hasattr(self.gpt2, "device") else next(self.parameters()).device
 
         # Assuming n_digit=32, codebook_size=256
         n_items = self.dataset.n_items
         n_digit = self.tokenizer.n_digit
         codebook_size = self.tokenizer.codebook_size
-
+        chunk_size=self.chunk_size
         # 1) Reshape first 8192 rows of token embeddings into [32, 256, d]
         #    ignoring 2 rows which might be special tokens
         #    shape: (32, 256, d)
@@ -155,6 +155,8 @@ class RPG(AbstractModel):
         # We do a batch matrix multiply to get (256 x 256) for each group
         # => token_sims: (32, 256, 256)
         token_embs = F.normalize(token_embs, dim=-1)
+        if use_half:
+            token_embs = token_embs.to(torch.float16)
         token_sims = torch.bmm(token_embs, token_embs.transpose(1, 2))
 
         # 3) Convert [-1, 1] to [0, 1] range
@@ -162,7 +164,7 @@ class RPG(AbstractModel):
 
         indices=[]
         values=[]
-        threshold=0.5 # 只存储显著非零值
+        item_tokens=self.item_id2tokens
         # 4) Prepare an output similarity matrix
         # item_item_sim = torch.zeros((n_items, n_items), device=self.gpt2.device, dtype=torch.float32)
 
@@ -171,21 +173,24 @@ class RPG(AbstractModel):
             i_end = min(i_start + self.chunk_size, n_items)
 
             # shape: (chunk_i_size, 32)
-            tokens_i = self.item_id2tokens[i_start:i_end]  # sub-block for items i
-
+            tokens_i = item_tokens[i_start:i_end].to(device)  # sub-block for items i
+            bi = i_end-i_start
             for j_start in range(1, n_items, self.chunk_size):
                 j_end = min(j_start + self.chunk_size, n_items)
 
                 # shape: (chunk_j_size, 32)
-                tokens_j = self.item_id2tokens[j_start:j_end]  # sub-block for items j
+                tokens_j = item_tokens[j_start:j_end].to(device)  # sub-block for items j
+                bj=j_end-j_start
 
+                dtype_block = torch.float16 if use_half else torch.float32
+                sum_block = torch.zeros((bi, bj), device=device, dtype=dtype_block)
                 # We want to compute a sub-block of shape: (chunk_i_size, chunk_j_size).
                 # For each digit k in [0..31], we look up token_sims_01[k, tokens_i[i, k], tokens_j[j, k]].
 
                 # We'll accumulate the similarity for each of the 32 digits
-                block_size_i = i_end - i_start
-                block_size_j = j_end - j_start
-                sum_block = torch.zeros((block_size_i, block_size_j), device=self.gpt2.device, dtype=torch.float32)
+                # block_size_i = i_end - i_start
+                # block_size_j = j_end - j_start
+                # sum_block = torch.zeros((block_size_i, block_size_j), device=self.gpt2.device, dtype=torch.float32)
 
                 # We'll do a small loop over k=0..31 (which is constant = 32).
                 # Each token_sims_01[k] is (256, 256). We gather from it using:
@@ -211,42 +216,222 @@ class RPG(AbstractModel):
                     sum_block += temp
 
                 # Now take the average across the 32 digits
-                avg_block = sum_block / n_digit
-
-                mask=(avg_block > threshold) & (torch.arange(block_size_i, device=device).unsqueeze(1) <= torch.arange(block_size_j,device=device).unsqueeze(0))
-                i_indices,j_indices = torch.where(mask)
-                global_i=i_start+i_indices
-                global_j=j_start+j_indices
-                sim_values=avg_block[mask]
-                for idx in range(len(global_i)):
-                    indices.append([global_i[idx].item(),global_j[idx].item()])
-                    values.append(sim_values[idx].item())
+                avg_block = sum_block / n_digit.to(torch.float32)
+                j_offsets = torch.arange(bj, device=device)
+                global_j = j_start + j_offsets
+                for local_i in range(bi):
+                    global_i = i_start + local_i
+                    mask = (avg_block[local_i] > threshold) & (global_j >= global_i)
+                    if mask.any():
+                        js = global_j[mask]
+                        vs = avg_block[local_i, mask]
+                        # 收集 CPU 列表（避免GPU大占用）
+                        indices.extend([[global_i, int(j.item())] for j in js])
+                        values.extend([float(v.item()) for v in vs])
+                # mask=(avg_block > threshold) & (torch.arange(block_size_i, device=device).unsqueeze(1) <= torch.arange(block_size_j,device=device).unsqueeze(0))
+                # i_indices,j_indices = torch.where(mask)
+                # global_i=i_start+i_indices
+                # global_j=j_start+j_indices
+                # sim_values=avg_block[mask]
+                # for idx in range(len(global_i)):
+                #     indices.append([global_i[idx].item(),global_j[idx].item()])
+                #     values.append(sim_values[idx].item())
+                del tokens_j, avg_block, sum_block
+            del tokens_i
         if indices:
-            indices = torch.tensor(indices, device=self.gpt2.device).t()
-            values = torch.tensor(values, device=self.gpt2.device)
-            return torch.sparse_coo_tensor(indices, values, (n_items, n_items))
+            idx_t = torch.tensor(indices, dtype=torch.int64).t()  # (2,nnz)
+            val_t = torch.tensor(values, dtype=torch.float32)
+            return torch.sparse_coo_tensor(idx_t, val_t, (n_items, n_items)).coalesce()
         else:
-            return torch.sparse_coo_tensor(torch.empty((2,0),dtype=torch.long),
-                                           torch.empty(0),
-                                           size=(n_items, n_items))
+            return torch.sparse_coo_tensor(torch.empty((2,0),dtype=torch.int64),
+                                           torch.empty((0,), dtype=torch.float32),
+                                           size=(n_items, n_items)).coalesce()
                 # Write back into the final item_item_sim
         #         item_item_sim[i_start:i_end, j_start:j_end] = avg_block
         #
         # return item_item_sim
 
-    def build_adjacency_list(self, item_item_sim):
+    def build_adjacency_list(self, item_item_sim=None):
+        K=self.n_edges
+        device=self.gpt2.device if hasattr(self.gpt2, "device") else next(self.parameters()).device
+        if item_item_sim is None:
+            adj_idx, _ = self.build_ii_topk_adjacency(use_threshold=False, threshold=0.5, use_half=False)
+            return adj_idx
         if item_item_sim.is_sparse:
-            item_item_sim_dense=item_item_sim.todense()
-        else:
-            item_item_sim_dense = item_item_sim
-        return torch.topk(item_item_sim_dense, k=self.n_edges, dim=-1).indices
+        #     item_item_sim_dense=item_item_sim.todense()
+        # else:
+        #     item_item_sim_dense = item_item_sim
+        # return torch.topk(item_item_sim_dense, k=self.n_edges, dim=-1).indices
+            coo = item_item_sim.coalesce()
+            indices = coo.indices().cpu()  # (2, nnz)
+            values = coo.values().cpu()  # (nnz,)
+            n_items = coo.size(0)
 
+            buckets = [[] for _ in range(n_items)]
+            for e in range(values.numel()):
+                i = int(indices[0, e])
+                j = int(indices[1, e])
+                v = float(values[e])
+                buckets[i].append((j, v))
+                if i != j:
+                    buckets[j].append((i, v))
+
+            adjacency_indices = torch.zeros((n_items, K), dtype=torch.int64)
+            for i in range(n_items):
+                if not buckets[i]:
+                    adjacency_indices[i] = i
+                    continue
+                js, vs = zip(*buckets[i])
+                js_t = torch.tensor(js, dtype=torch.int64)
+                vs_t = torch.tensor(vs, dtype=torch.float32)
+                if js_t.numel() < K:
+                    pad = K - js_t.numel()
+                    js_t = torch.cat([js_t, torch.full((pad,), i, dtype=torch.int64)])
+                    vs_t = torch.cat([vs_t, torch.ones((pad,), dtype=torch.float32)])
+                _, topi = torch.topk(vs_t, k=K, largest=True, sorted=True)
+                adjacency_indices[i] = js_t[topi]
+            return adjacency_indices.to(device)
+        else:
+            return torch.topk(item_item_sim, k=K, dim=-1).indices
+    def build_ii_topk_adjacency(self, use_threshold=False, threshold=0.5, use_half=False):
+        device= self.gpt2.device if hasattr(self, 'gpt2') else next(self.parameters()).device
+
+        n_items = self.dataset.n_items
+        n_digit=self.tokenizer.n_digit
+        codebook_size=self.tokenizer.codebook_size
+        K=self.n_edges
+        chunk_size=self.chunk_size
+
+        # 1) 预处理token相似度表（n_digit, codebook_size, codebook_size）
+        token_embs=self.gpt2.wte.weight[1:-1].view(n_digit, codebook_size, -1)
+        token_embs = F.normalize(token_embs, dim=-1)
+        if use_half:
+            token_embs=token_embs.to(torch.float16)
+        token_sims = torch.bmm(token_embs, token_embs.transpose(1, 2))
+        token_sims_01 = 0.5 * (token_sims + 1.0)
+
+        # 2）在CPU上准备候选收集容器
+        item_tokens=self.item_id2tokens.cpu()
+        row_candidates_idx=[None]*n_items
+        row_candidates_val=[None]*n_items
+
+        # 3) 上三角分块计算并收集候选
+        for i_start in range(1, n_items, chunk_size):
+            i_end = min(i_start + chunk_size, n_items)
+            bi = i_end - i_start
+            tokens_i = item_tokens[i_start:i_end]
+            tokens_i_dev=tokens_i.to(device, non_blocking=True)
+
+            for j_start in range(i_start, n_items, chunk_size):
+                j_end = min(j_start + chunk_size, n_items)
+                bj=j_end - j_start
+                tokens_j=item_tokens[j_start:j_end]
+                tokens_j_dev=tokens_j.to(device, non_blocking=True)
+
+                #计算块内相似度
+                dtype_block=torch.float16 if use_half else torch.float32
+                sum_block=torch.zeros((bi,bj), device=device, dtype=dtype_block)
+
+                for k in range(n_digit):
+                    # 映射到局部索引并计算相似度
+                    row_inds = tokens_i_dev[:, k] - k * codebook_size - 1
+                    col_inds = tokens_j_dev[:, k] - k * codebook_size - 1
+                    temp = token_sims_01[k].index_select(0, row_inds).index_select(1, col_inds)
+                    sum_block += temp
+                avg_block = sum_block / n_digit
+
+                # 应用阈值过滤
+                if use_threshold:
+                    mask = avg_block > threshold
+                else:
+                    mask = torch.ones_like(avg_block, dtype=torch.bool)
+
+                # 收集候选对
+                with torch.no_grad():
+                    for local_i in range(bi):
+                        global_i = i_start + local_i
+                        row_mask = mask[local_i]
+                        j_offsets = torch.arange(bj, device=device)
+                        global_j = j_start + j_offsets
+                        # 限制到上三角（j >= i）
+                        row_mask = row_mask & (global_j >= global_i)
+                        if not row_mask.any():
+                            continue
+                        global_js = global_j[row_mask].to(torch.int64)
+                        sim_vals = avg_block[local_i, row_mask].to(torch.float32)
+                        # 保存到候选列表
+                        cpu_js = global_js.detach().cpu()
+                        cpu_vals = sim_vals.detach().cpu()
+                        if row_candidates_idx[global_i] is None:
+                            row_candidates_idx[global_i] = cpu_js
+                            row_candidates_val[global_i] = cpu_vals
+                        else:
+                            row_candidates_idx[global_i] = torch.cat([row_candidates_idx[global_i], cpu_js], dim=0)
+                            row_candidates_val[global_i] = torch.cat([row_candidates_val[global_i], cpu_vals], dim=0)
+                # 清理中间变量释放显存
+                del tokens_j_dev, avg_block, sum_block
+            del tokens_i_dev
+        # 4) 对称化：将 (i,j) 添加到 j 的候选列表
+        for i in range(n_items):
+            js = row_candidates_idx[i]
+            vals = row_candidates_val[i]
+
+            if js is None:
+                continue
+
+            for idx in range(js.numel()):
+                j = int(js[idx])
+                if j == i:
+                    continue
+
+                v = vals[idx:idx + 1]
+                j_tensor = torch.tensor([i], dtype=torch.int64)
+
+                if row_candidates_idx[j] is None:
+                    row_candidates_idx[j] = j_tensor
+                    row_candidates_val[j] = v
+                else:
+                    row_candidates_idx[j] = torch.cat([row_candidates_idx[j], j_tensor], dim=0)
+                    row_candidates_val[j] = torch.cat([row_candidates_val[j], v], dim=0)
+        # 5) 每行进行 top-K 选择，生成最终的邻接矩阵
+        adjacency_indices = torch.zeros((n_items, K), dtype=torch.int64)
+        adjacency_values = torch.zeros((n_items, K), dtype=torch.float32)
+        for i in range(n_items):
+            js = row_candidates_idx[i]
+            vals = row_candidates_val[i]
+
+            # 处理没有候选的情况
+            if js is None or js.numel() == 0:
+                adjacency_indices[i] = i
+                adjacency_values[i] = 1.0
+                continue
+
+            # 候选不足时填充自身
+            if js.numel() < K:
+                pad_n = K - js.numel()
+                js = torch.cat([js, torch.full((pad_n,), i, dtype=torch.int64)], dim=0)
+                vals = torch.cat([vals, torch.ones((pad_n,), dtype=torch.float32)], dim=0)
+
+            # 选择 top-K
+            topv, topi = torch.topk(vals, k=K, largest=True, sorted=True)
+            adjacency_indices[i] = js[topi]
+            adjacency_values[i] = topv
+
+            # 转移到目标设备
+        adjacency_indices = adjacency_indices.to(device, non_blocking=True)
+        adjacency_values = adjacency_values.to(device, non_blocking=True)
+
+        return adjacency_indices, adjacency_values
+    # def init_graph(self):
+    #     self.tokenizer.log("Building item-item similarity matrix...")
+    #     item_item_sim = self.build_ii_sim_mat()
+    #     self.adjacency = self.build_adjacency_list(item_item_sim)
+    #     self.tokenizer.log("Graph initialized.")
     def init_graph(self):
         self.tokenizer.log("Building item-item similarity matrix...")
-        item_item_sim = self.build_ii_sim_mat()
-        self.adjacency = self.build_adjacency_list(item_item_sim)
+        adj_idx,_=self.build_ii_topk_adjacency(use_threshold=False, threshold=0.5, use_half=False)
+        self.adjacency = adj_idx
         self.tokenizer.log("Graph initialized.")
-
     def graph_propagation(self, token_logits, n_return_sequences):
         batch_size = token_logits.shape[0]
 

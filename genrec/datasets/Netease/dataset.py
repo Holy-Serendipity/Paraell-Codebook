@@ -82,6 +82,8 @@ class Netease(AbstractDataset):
             for role_id, items in item_seqs.items():
                 if len(items) < min_interactions:
                     continue
+                if len(items) > max_interactions:
+                    items = items[:max_interactions+1]
                 if min_time_range:
                     timestamps=[ts for _, ts in items]
                     time_range=max(timestamps)-min(timestamps)
@@ -132,7 +134,7 @@ class Netease(AbstractDataset):
             self.all_item_seqs[str(user)] = mapped_items
 
         return self.all_item_seqs, self.id_mapping
-    def process_likes(self, input_path:str, output_path:str)->tuple[dict,dict]:
+    def process_likes(self, input_path:str, output_path:str, min_interactions:int, max_interactions:int, min_time_range:int)->tuple[dict,dict]:
         seq_file=os.path.join(output_path, "all_item_seqs.json")
         id_mapping_file=os.path.join(output_path, "id_mapping.json")
         if os.path.exists(seq_file) and os.path.exists(id_mapping_file):
@@ -147,9 +149,9 @@ class Netease(AbstractDataset):
         item_seqs = self.load_likes(input_file, sort_method='time')
         item_seqs_filtered = self.advanced_filter(
             item_seqs,
-            min_interactions=3,
-            max_interactions=None,
-            min_time_range=None,
+            min_interactions=min_interactions,
+            max_interactions=max_interactions,
+            min_time_range=min_time_range,
         )
         mapped_item_seqs, id_mapping = self.remap_ids(item_seqs_filtered)
         self.save_to_json(mapped_item_seqs, os.path.join(output_path,"all_item_seqs.json"))
@@ -271,7 +273,10 @@ class Netease(AbstractDataset):
 
         self.all_item_seqs, self.id_mapping = self.process_likes(
             input_path= raw_data_path,
-            output_path= processed_data_path
+            output_path= processed_data_path,
+            min_interactions=3,
+            max_interactions=30,
+            min_time_range=eval("7*86400")
         )
 
         self.item2meta = self.process_meta(

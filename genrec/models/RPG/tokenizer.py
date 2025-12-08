@@ -9,7 +9,8 @@ import faiss.contrib.torch
 from genrec.dataset import AbstractDataset
 from genrec.tokenizer import AbstractTokenizer
 from FlagEmbedding import BGEM3FlagModel
-
+import vllm
+from vllm import LLM
 class RPGTokenizer(AbstractTokenizer):
     """
     An example when "codebook_size == 256, n_codebooks == 32":
