@@ -311,9 +311,11 @@ class RPG(AbstractModel):
         token_sims_01 = 0.5 * (token_sims + 1.0)
 
         # 2）在CPU上准备候选收集容器
+        adjacency_js = torch.full((n_items, K), -1, dtype=torch.int64)  # 邻居索引
+        adjacency_vs = torch.full((n_items, K), float("-inf"), dtype=torch.float32)  # 相似度
         item_tokens=self.item_id2tokens.cpu()
-        row_candidates_idx=[None]*n_items
-        row_candidates_val=[None]*n_items
+        # row_candidates_idx=[None]*n_items
+        # row_candidates_val=[None]*n_items
 
         # 3) 上三角分块计算并收集候选
         for i_start in range(1, n_items, chunk_size):
@@ -338,88 +340,137 @@ class RPG(AbstractModel):
                     col_inds = tokens_j_dev[:, k] - k * codebook_size - 1
                     temp = token_sims_01[k].index_select(0, row_inds).index_select(1, col_inds)
                     sum_block += temp
-                avg_block = sum_block / n_digit
+                avg_block = (sum_block / n_digit).to(torch.float32)
 
                 # 应用阈值过滤
                 if use_threshold:
                     mask = avg_block > threshold
                 else:
-                    mask = torch.ones_like(avg_block, dtype=torch.bool)
-
+                    mask = None
+                j_offsets = torch.arange(bj, device=device)
+                global_j = j_start + j_offsets
                 # 收集候选对
                 with torch.no_grad():
                     for local_i in range(bi):
                         global_i = i_start + local_i
-                        row_mask = mask[local_i]
-                        j_offsets = torch.arange(bj, device=device)
-                        global_j = j_start + j_offsets
-                        # 限制到上三角（j >= i）
-                        row_mask = row_mask & (global_j >= global_i)
-                        if not row_mask.any():
-                            continue
-                        global_js = global_j[row_mask].to(torch.int64)
-                        sim_vals = avg_block[local_i, row_mask].to(torch.float32)
-                        # 保存到候选列表
-                        cpu_js = global_js.detach().cpu()
-                        cpu_vals = sim_vals.detach().cpu()
-                        if row_candidates_idx[global_i] is None:
-                            row_candidates_idx[global_i] = cpu_js
-                            row_candidates_val[global_i] = cpu_vals
+
+                        row_vals=avg_block[local_i]
+                        row_js=global_j
+                        tri_mask=(row_js>=global_i)
+                        if mask is not None:
+                            tri_mask = tri_mask & mask[local_i]
+
+                        if tri_mask.any():
+                            row_vals = row_vals[tri_mask]
+                            row_js = row_js[tri_mask]
                         else:
-                            row_candidates_idx[global_i] = torch.cat([row_candidates_idx[global_i], cpu_js], dim=0)
-                            row_candidates_val[global_i] = torch.cat([row_candidates_val[global_i], cpu_vals], dim=0)
+                            continue
+                        # row_mask = mask[local_i]
+                        # j_offsets = torch.arange(bj, device=device)
+                        # global_j = j_start + j_offsets
+                        # 限制到上三角（j >= i）
+                        # row_mask = row_mask & (global_j >= global_i)
+                        # if not row_mask.any():
+                        #     continue
+                        # global_js = global_j[row_mask].to(torch.int64)
+                        # sim_vals = avg_block[local_i, row_mask].to(torch.float32)
+                        # # 保存到候选列表
+                        # cpu_js = global_js.detach().cpu()
+                        # cpu_vals = sim_vals.detach().cpu()
+                        # if row_candidates_idx[global_i] is None:
+                        #     row_candidates_idx[global_i] = cpu_js
+                        #     row_candidates_val[global_i] = cpu_vals
+                        # else:
+                        #     row_candidates_idx[global_i] = torch.cat([row_candidates_idx[global_i], cpu_js], dim=0)
+                        #     row_candidates_val[global_i] = torch.cat([row_candidates_val[global_i], cpu_vals], dim=0)
+                            # 块内局部 top-K（限制最多 K 个）
+                        if row_vals.numel() > K:
+                            blk_top_vals, blk_top_idx = torch.topk(row_vals, k=K, largest=True)
+                            blk_top_js = row_js[blk_top_idx]
+                        else:
+                            blk_top_vals = row_vals
+                            blk_top_js = row_js
+                        # 与全局缓冲归并：拼接再取 top-K（最多 2K）
+                        merge_js = torch.cat([adjacency_js[global_i], blk_top_js.cpu()], dim=0)
+                        merge_vs = torch.cat([adjacency_vs[global_i], blk_top_vals.cpu()], dim=0)
+                        top_vals, top_idx = torch.topk(merge_vs, k=K, largest=True)
+                        adjacency_js[global_i] = merge_js[top_idx]
+                        adjacency_vs[global_i] = top_vals
+                for local_j in range(bj):
+                    global_j = j_start + local_j
+                    col_vals = avg_block[:, local_j]  # (bi,)
+                    col_is = torch.arange(bi, device=device) + i_start
+                    tri_mask2 = (col_is <= global_j)
+                    if use_threshold:
+                        tri_mask2 = tri_mask2 & (avg_block[:, local_j] > threshold)
+                    if tri_mask2.any():
+                        col_vals = col_vals[tri_mask2]
+                        col_is = col_is[tri_mask2]
+                    else:
+                        continue
+                    if col_vals.numel() > K:
+                        blk_top_vals2, blk_top_idx2 = torch.topk(col_vals, k=K, largest=True)
+                        blk_top_is2 = col_is[blk_top_idx2]
+                    else:
+                        blk_top_vals2 = col_vals
+                        blk_top_is2 = col_is
+                    merge_js2 = torch.cat([adjacency_js[global_j], blk_top_is2.cpu()], dim=0)
+                    merge_vs2 = torch.cat([adjacency_vs[global_j], blk_top_vals2.cpu()], dim=0)
+                    top_vals2, top_idx2 = torch.topk(merge_vs2, k=K, largest=True)
+                    adjacency_js[global_j] = merge_js2[top_idx2]
+                    adjacency_vs[global_j] = top_vals2
                 # 清理中间变量释放显存
                 del tokens_j_dev, avg_block, sum_block
             del tokens_i_dev
         # 4) 对称化：将 (i,j) 添加到 j 的候选列表
-        for i in range(n_items):
-            js = row_candidates_idx[i]
-            vals = row_candidates_val[i]
-
-            if js is None:
-                continue
-
-            for idx in range(js.numel()):
-                j = int(js[idx])
-                if j == i:
-                    continue
-
-                v = vals[idx:idx + 1]
-                j_tensor = torch.tensor([i], dtype=torch.int64)
-
-                if row_candidates_idx[j] is None:
-                    row_candidates_idx[j] = j_tensor
-                    row_candidates_val[j] = v
-                else:
-                    row_candidates_idx[j] = torch.cat([row_candidates_idx[j], j_tensor], dim=0)
-                    row_candidates_val[j] = torch.cat([row_candidates_val[j], v], dim=0)
+        # for i in range(n_items):
+        #     js = row_candidates_idx[i]
+        #     vals = row_candidates_val[i]
+        #
+        #     if js is None:
+        #         continue
+        #
+        #     for idx in range(js.numel()):
+        #         j = int(js[idx])
+        #         if j == i:
+        #             continue
+        #
+        #         v = vals[idx:idx + 1]
+        #         j_tensor = torch.tensor([i], dtype=torch.int64)
+        #
+        #         if row_candidates_idx[j] is None:
+        #             row_candidates_idx[j] = j_tensor
+        #             row_candidates_val[j] = v
+        #         else:
+        #             row_candidates_idx[j] = torch.cat([row_candidates_idx[j], j_tensor], dim=0)
+        #             row_candidates_val[j] = torch.cat([row_candidates_val[j], v], dim=0)
         # 5) 每行进行 top-K 选择，生成最终的邻接矩阵
-        adjacency_indices = torch.zeros((n_items, K), dtype=torch.int64)
-        adjacency_values = torch.zeros((n_items, K), dtype=torch.float32)
-        for i in range(n_items):
-            js = row_candidates_idx[i]
-            vals = row_candidates_val[i]
-
-            # 处理没有候选的情况
-            if js is None or js.numel() == 0:
-                adjacency_indices[i] = i
-                adjacency_values[i] = 1.0
-                continue
-
-            # 候选不足时填充自身
-            if js.numel() < K:
-                pad_n = K - js.numel()
-                js = torch.cat([js, torch.full((pad_n,), i, dtype=torch.int64)], dim=0)
-                vals = torch.cat([vals, torch.ones((pad_n,), dtype=torch.float32)], dim=0)
-
-            # 选择 top-K
-            topv, topi = torch.topk(vals, k=K, largest=True, sorted=True)
-            adjacency_indices[i] = js[topi]
-            adjacency_values[i] = topv
+        # adjacency_indices = torch.zeros((n_items, K), dtype=torch.int64)
+        # adjacency_values = torch.zeros((n_items, K), dtype=torch.float32)
+        # for i in range(n_items):
+        #     js = row_candidates_idx[i]
+        #     vals = row_candidates_val[i]
+        #
+        #     # 处理没有候选的情况
+        #     if js is None or js.numel() == 0:
+        #         adjacency_indices[i] = i
+        #         adjacency_values[i] = 1.0
+        #         continue
+        #
+        #     # 候选不足时填充自身
+        #     if js.numel() < K:
+        #         pad_n = K - js.numel()
+        #         js = torch.cat([js, torch.full((pad_n,), i, dtype=torch.int64)], dim=0)
+        #         vals = torch.cat([vals, torch.ones((pad_n,), dtype=torch.float32)], dim=0)
+        #
+        #     # 选择 top-K
+        #     topv, topi = torch.topk(vals, k=K, largest=True, sorted=True)
+        #     adjacency_indices[i] = js[topi]
+        #     adjacency_values[i] = topv
 
             # 转移到目标设备
-        adjacency_indices = adjacency_indices.to(device, non_blocking=True)
-        adjacency_values = adjacency_values.to(device, non_blocking=True)
+        adjacency_indices = adjacency_js.to(device, non_blocking=True)
+        adjacency_values = adjacency_vs.to(device, non_blocking=True)
 
         return adjacency_indices, adjacency_values
     # def init_graph(self):
