@@ -50,7 +50,12 @@ class RPG(AbstractModel):
         super(RPG, self).__init__(config, dataset, tokenizer)
 
         self.item_id2tokens = self._map_item_tokens().to(self.config['device'])
-
+        self.item_id_embedding=nn.Embedding(
+            num_embeddings=self.dataset.n_items+1,
+            embedding_dim=config['n_embd'],
+            padding_idx=0
+        )
+        self.fusion_gate = nn.Linear(config['n_embd'] * 2, config['n_embd'])
         gpt2config = GPT2Config(
             vocab_size=tokenizer.vocab_size,
             n_positions=tokenizer.max_token_seq_len,
@@ -108,8 +113,18 @@ class RPG(AbstractModel):
                 f'Total trainable parameters: {total_params}\n'
 
     def forward(self, batch: dict, return_loss=True) -> torch.Tensor:
-        input_tokens = self.item_id2tokens[batch['input_ids']]
-        input_embs = self.gpt2.wte(input_tokens).mean(dim=-2)
+        input_semantic_tokens = self.item_id2tokens[batch['input_ids']]
+        semantic_embs = self.gpt2.wte(input_semantic_tokens).mean(dim=-2)
+
+        inputs_ids=batch['input_ids']
+        id_embs = self.item_id_embedding(inputs_ids)
+
+        attention_mask = batch['attention_mask']
+        semantic_embs=semantic_embs*attention_mask.unsqueeze(-1)
+        id_embs=id_embs*attention_mask.unsqueeze(-1)
+        gate = torch.sigmoid(self.fusion_gate(torch.cat([semantic_embs, id_embs], dim=-1)))
+        input_embs = gate * semantic_embs + (1 - gate) * id_embs
+
         outputs = self.gpt2(
             inputs_embeds=input_embs,
             attention_mask=batch['attention_mask']
