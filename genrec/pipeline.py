@@ -49,7 +49,7 @@ class Pipeline:
             # 设置 wandb 运行名称（如果没有提供）
             wandb_run_name = self.config.get('wandb_run_name')
             if wandb_run_name is None:
-                wandb_run_name = f"{self.config['model']}-{self.config['dataset']}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                wandb_run_name = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{self.config['cache_dir'][6:12]}"
                 self.config['wandb_run_name'] = wandb_run_name
 
             # 初始化 wandb

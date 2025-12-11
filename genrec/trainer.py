@@ -155,12 +155,7 @@ class Trainer:
             avg_grad_norm = sum(grad_norms) / len(grad_norms) if grad_norms else 0
             avg_grad_mean = sum(grad_means) / len(grad_means) if grad_means else 0
             avg_train_loss = total_loss / len(train_dataloader)
-            self.accelerator.log({
-                "Loss/train_loss": avg_train_loss,
-                "LearningRate/lr": current_lr,
-                "Gradient/norm": avg_grad_norm,
-                "Gradient/mean": avg_grad_mean
-            }, step=epoch + 1)
+
 
             # 记录到 wandb
             if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
