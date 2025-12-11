@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import os
 import math
 import json
@@ -15,7 +9,8 @@ import faiss.contrib.torch
 from genrec.dataset import AbstractDataset
 from genrec.tokenizer import AbstractTokenizer
 from FlagEmbedding import BGEM3FlagModel
-
+import vllm
+from vllm import LLM
 class RPGTokenizer(AbstractTokenizer):
     """
     An example when "codebook_size == 256, n_codebooks == 32":
@@ -297,7 +292,7 @@ class RPGTokenizer(AbstractTokenizer):
         """
         # Load semantic IDs
         sem_ids_path = os.path.join(
-            dataset.cache_dir, 'processed',
+            dataset.cache_dir, 'processed', f'{self.config["n_codebook"]}-{self.n_codebook_bits}',
             f'{os.path.basename(self.config["sent_emb_model"])}_{self.index_factory}.sem_ids'
         )
 
@@ -309,17 +304,17 @@ class RPGTokenizer(AbstractTokenizer):
             )
             if os.path.exists(sent_emb_path):
                 self.log(f'[TOKENIZER] Loading sentence embeddings from {sent_emb_path}...')
-                sent_embs = np.fromfile(sent_emb_path, dtype=np.float32).reshape(-1, self.config['sent_emb_pca'])
+                sent_embs = np.fromfile(sent_emb_path, dtype=np.float32).reshape(-1, self.config['sent_emb_dim'])
             else:
                 self.log(f'[TOKENIZER] Encoding sentence embeddings...')
                 sent_embs = self._encode_sent_emb(dataset, sent_emb_path)
-                # PCA
-                if self.config['sent_emb_pca'] > 0:
-                    self.log(f'[TOKENIZER] Applying PCA to sentence embeddings...')
-                    from sklearn.decomposition import PCA
-                    pca = PCA(n_components=self.config['sent_emb_pca'], whiten=True)
-                    sent_embs = pca.fit_transform(sent_embs)
-                self.log(f'[TOKENIZER] Sentence embeddings shape: {sent_embs.shape}')
+            # PCA
+            if self.config['sent_emb_pca'] > 0:
+                self.log(f'[TOKENIZER] Applying PCA to sentence embeddings...')
+                from sklearn.decomposition import PCA
+                pca = PCA(n_components=self.config['sent_emb_pca'], whiten=True)
+                sent_embs = pca.fit_transform(sent_embs)
+            self.log(f'[TOKENIZER] Sentence embeddings shape: {sent_embs.shape}')
 
             # Generate semantic IDs
             training_item_mask = self._get_items_for_training(dataset)

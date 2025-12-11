@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import os
 from tqdm import tqdm
 import numpy as np
@@ -87,18 +81,18 @@ class Trainer:
         self.model, optimizer, train_dataloader, val_dataloader, scheduler = self.accelerator.prepare(
             self.model, optimizer, train_dataloader, val_dataloader, scheduler
         )
-        self.accelerator.init_trackers(
-            project_name=get_file_name(self.config, suffix=''),
-            config=config_for_log(self.config),
-            init_kwargs={"tensorboard": {"flush_secs": 60}},
-        )
+        # self.accelerator.init_trackers(
+        #     project_name=get_file_name(self.config, suffix=''),
+        #     config=config_for_log(self.config),
+        #     init_kwargs={"tensorboard": {"flush_secs": 60}},
+        # )
 
         n_epochs = np.ceil(total_n_steps / (len(train_dataloader) * self.accelerator.num_processes)).astype(int)
         best_epoch = 0
         best_val_score = -1
 
         # 记录训练开始信息
-        if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+        if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
             wandb.log({
                 'info/training_started': 1,
                 'training/total_epochs': n_epochs,
@@ -118,11 +112,30 @@ class Trainer:
             # 记录学习率
             current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else self.config['lr']
 
+            grad_norms=[]
+            grad_means=[]
             for batch_idx, batch in enumerate(train_progress_bar):
                 optimizer.zero_grad()
                 outputs = self.model(batch)
                 loss = outputs.loss
                 self.accelerator.backward(loss)
+                # 计算梯度统计信息
+                batch_grad_norm = 0.0
+                batch_grad_means = []
+
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.data.norm(2).item()
+                        param_mean = param.grad.data.mean().item()
+                        batch_grad_norm += param_norm ** 2
+                        batch_grad_means.append(param_mean)
+                # 计算当前batch的梯度统计
+                batch_grad_norm = batch_grad_norm ** 0.5
+                batch_grad_mean = sum(batch_grad_means) / len(batch_grad_means) if batch_grad_means else 0
+
+                # 存储用于epoch统计
+                grad_norms.append(batch_grad_norm)
+                grad_means.append(batch_grad_mean)
                 if self.config['max_grad_norm'] is not None:
                     clip_grad_norm_(self.model.parameters(), self.config['max_grad_norm'])
                 optimizer.step()
@@ -130,25 +143,34 @@ class Trainer:
                 total_loss = total_loss + loss.item()
 
                 # 记录批次级别的指标（可选，避免太频繁）
-                if batch_idx % 100 == 0 and self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                if batch_idx % 100 == 0 and self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
                     wandb.log({
                         'batch/loss': loss.item(),
                         'batch/lr': current_lr,
-                        'batch/step': epoch * len(train_dataloader) + batch_idx
+                        'batch/step': epoch * len(train_dataloader) + batch_idx,
+                        'batch/grad_norm': batch_grad_norm,
+                        'batch/grad_mean': batch_grad_mean
                     })
+            # 计算整个epoch的平均梯度统计
+            avg_grad_norm = sum(grad_norms) / len(grad_norms) if grad_norms else 0
+            avg_grad_mean = sum(grad_means) / len(grad_means) if grad_means else 0
             avg_train_loss = total_loss / len(train_dataloader)
             self.accelerator.log({
                 "Loss/train_loss": avg_train_loss,
-                "LearningRate/lr": current_lr
+                "LearningRate/lr": current_lr,
+                "Gradient/norm": avg_grad_norm,
+                "Gradient/mean": avg_grad_mean
             }, step=epoch + 1)
 
             # 记录到 wandb
-            if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+            if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
                 wandb.log({
                     'epoch': epoch + 1,
                     'train/loss': avg_train_loss,
                     'train/learning_rate': current_lr,
-                    'train/epoch_progress': (epoch + 1) / n_epochs
+                    'train/epoch_progress': (epoch + 1) / n_epochs,
+                    'train/grad_norm': avg_grad_norm,
+                    'train/grad_mean': avg_grad_mean
                 })
 
             self.log(f'[Epoch {epoch + 1}] Train Loss: {total_loss / len(train_dataloader)}')
@@ -160,7 +182,7 @@ class Trainer:
                     for key in all_results:
                         self.accelerator.log({f"Val_Metric/{key}": all_results[key]}, step=epoch + 1)
                     # 记录到 wandb
-                    if hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                    if 'wandb_run' in self.config and self.config.get('wandb_run'):
                         wandb_log_data = {'epoch': epoch + 1}
                         for key, value in all_results.items():
                             wandb_log_data[f'val/{key}'] = value
@@ -172,7 +194,7 @@ class Trainer:
                     best_epoch = epoch + 1
 
                     # 记录最佳结果到 wandb
-                    if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get(
+                    if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get(
                             'wandb_run'):
                         wandb.log({
                             'best/val_score': best_val_score,
@@ -187,7 +209,7 @@ class Trainer:
                             torch.save(self.model.state_dict(), self.saved_model_ckpt)
 
                         # 记录模型保存到 wandb
-                        if hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+                        if 'wandb_run' in self.config and self.config.get('wandb_run'):
                             wandb.log({'info/model_saved': 1})
 
                         self.log(f'[Epoch {epoch + 1}] Saved model checkpoint to {self.saved_model_ckpt}')
@@ -196,14 +218,14 @@ class Trainer:
                     self.log(f'Early stopping at epoch {epoch + 1}')
 
                     # 记录早停信息到 wandb
-                    if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get(
+                    if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get(
                             'wandb_run'):
                         wandb.log({'info/early_stopping': epoch + 1})
 
                     break
 
         # 记录训练完成信息
-        if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+        if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
             wandb.log({
                 'info/training_completed': 1,
                 'best/final_val_score': best_val_score,
@@ -259,7 +281,7 @@ class Trainer:
         output_results['n_visited_items'] = torch.cat(all_results['n_visited_items']).mean().item()
 
         # 记录评估完成
-        if self.accelerator.is_main_process and hasattr(self.config, 'wandb_run') and self.config.get('wandb_run'):
+        if self.accelerator.is_main_process and 'wandb_run' in self.config and self.config.get('wandb_run'):
             wandb.log({f'info/{split}_evaluation_completed': 1})
 
         return output_results
