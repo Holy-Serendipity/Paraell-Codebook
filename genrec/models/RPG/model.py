@@ -78,8 +78,13 @@ class RPG(AbstractModel):
         self.n_pred_head = self.tokenizer.n_digit
         pred_head_list = []
         for i in range(self.n_pred_head):
-            pred_head_list.append(ResBlock(self.config['n_embd']))
-        self.pred_heads = nn.Sequential(*pred_head_list)
+            # pred_head_list.append(ResBlock(self.config['n_embd']))
+            if i<64:
+                head=ResBlock(config['n_embd'])
+            else:
+                head=nn.Linear(config['n_embd'], config['n_embd'])
+            pred_head_list.append(head)
+        self.pred_heads = nn.ModuleList(pred_head_list)
 
         self.temperature = self.config['temperature']
         self.loss_fct = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.ignored_label)
