@@ -56,6 +56,7 @@ class RPG(AbstractModel):
             padding_idx=0
         )
         self.fusion_gate = nn.Linear(config['n_embd'] * 2, config['n_embd'])
+        self.id_scale = nn.Parameter(torch.tensor(0.1))
         gpt2config = GPT2Config(
             vocab_size=tokenizer.vocab_size,
             n_positions=tokenizer.max_token_seq_len,
@@ -116,8 +117,7 @@ class RPG(AbstractModel):
         input_semantic_tokens = self.item_id2tokens[batch['input_ids']]
         semantic_embs = self.gpt2.wte(input_semantic_tokens).mean(dim=-2)
 
-        inputs_ids=batch['input_ids']
-        id_embs = self.item_id_embedding(inputs_ids)
+        id_embs = self.item_id_embedding(batch['input_ids'])
 
         attention_mask = batch['attention_mask']
         semantic_embs=semantic_embs*attention_mask.unsqueeze(-1)
@@ -129,7 +129,9 @@ class RPG(AbstractModel):
             inputs_embeds=input_embs,
             attention_mask=batch['attention_mask']
         )
-        final_states = [self.pred_heads[i](outputs.last_hidden_state).unsqueeze(-2) for i in range(self.n_pred_head)]
+        # final_states = [self.pred_heads[i](outputs.last_hidden_state).unsqueeze(-2) for i in range(self.n_pred_head)]
+        combine_states = outputs.last_hidden_state+self.id_scale*id_embs
+        final_states=[self.pred_heads[i](combine_states).unsqueeze(-2) for i in range(self.n_pred_head)]
         final_states = torch.cat(final_states, dim=-2)
         outputs.final_states = final_states
         if return_loss:
