@@ -19,11 +19,14 @@ class ResBlock(nn.Module):
         hidden_size (int): The size of the hidden layers in the block.
     """
 
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, dropout=0.1):
         super().__init__()
+        self.norm = nn.LayerNorm(hidden_size)
         self.linear = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
         # Initialize as an identity mapping
-        torch.nn.init.zeros_(self.linear.weight)
+        nn.init.xavier_uniform_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
         # Use SiLU activation to keep consistent with the Llama model
         self.act = nn.SiLU()
 
@@ -37,7 +40,12 @@ class ResBlock(nn.Module):
         Returns:
             torch.Tensor: Output after the residual connection and activation.
         """
-        return x + self.act(self.linear(x))
+        residual = x
+        x = self.norm(x)
+        x = self.linear(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        return x + residual
 
 
 class RPG(AbstractModel):
@@ -88,7 +96,18 @@ class RPG(AbstractModel):
 
         self.temperature = self.config['temperature']
         self.loss_fct = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.ignored_label)
-
+        # Group by layer
+        self.num_groups = config['num_groups']
+        self.group_temperature = self.config['group_temperature']
+        self.group_loss_weight = self.config['group_loss_weight']
+        self.consistency_loss_weight = self.config['consistency_loss_weight']
+        #Group attention
+        self.group_attention = nn.Linear(config['n_embd'], self.num_groups)
+        #Group prototype
+        self.group_prototype = nn.Parameter(torch.randn(self.num_groups, config['n_embd']))
+        nn.init.normal_(self.group_prototype, mean=0.0, std=0.02)
+        #Group representation project network
+        # self.group_projection = nn.Linear(config['n_embd'], config['n_embd'])
         # Graph-constrained decoding
         self.generate_w_decoding_graph = False
         self.init_flag = False
@@ -138,23 +157,215 @@ class RPG(AbstractModel):
         combine_states = outputs.last_hidden_state+self.id_scale*id_embs
         final_states=[self.pred_heads[i](combine_states).unsqueeze(-2) for i in range(self.n_pred_head)]
         final_states = torch.cat(final_states, dim=-2)
+        bs, seq_len, num_heads, h_dim = final_states.shape
         outputs.final_states = final_states
         if return_loss:
             assert 'labels' in batch, 'The batch must contain the labels.'
             label_mask = batch['labels'].view(-1) != -100
-            selected_states = final_states.view(-1, self.n_pred_head, self.config['n_embd'])[label_mask]
+            selected_states = final_states.view(-1, num_heads, h_dim)[label_mask]
             selected_states = F.normalize(selected_states, dim=-1)
-            selected_states = torch.chunk(selected_states, self.n_pred_head, dim=1)
+            selected_states = torch.chunk(selected_states, num_heads, dim=1)
             token_emb = self.gpt2.wte.weight[1:-1]
             token_emb = F.normalize(token_emb, dim=-1)
-            token_embs = torch.chunk(token_emb, self.n_pred_head, dim=0)
+            token_embs = torch.chunk(token_emb, num_heads, dim=0)
             token_logits = [torch.matmul(selected_states[i].squeeze(dim=1), token_embs[i].T) / self.temperature for i in range(self.n_pred_head)]
             token_labels = self.item_id2tokens[batch['labels'].view(-1)[label_mask]]
             losses = [
                 self.loss_fct(token_logits[i], token_labels[:, i] - i * self.config['codebook_size'] - 1)
                 for i in range(self.n_pred_head)
             ]
-            outputs.loss = torch.mean(torch.stack(losses))
+            # outputs.loss = torch.mean(torch.stack(losses))
+            #token level losses
+            token_level_loss = torch.mean(torch.stack(losses))
+            #contrastive group losses
+
+            # a. calculate degree of
+            attn_weights = self.group_attention(final_states.view(-1, h_dim))
+            attn_weights = attn_weights.view(bs, seq_len, num_heads, self.num_groups)
+            attn_weights = F.softmax(attn_weights, dim=-1)
+
+            #b. create group representation
+            group_reps = torch.einsum('bsng, bsnd->bsgd', attn_weights, final_states)
+            group_reps = F.normalize(group_reps, dim=-1)
+
+            #c.calculate group contrastive loss
+            # 同一批次中，门控值相近的物品，组表示应更相似
+            # 将每个序列最后一个位置（预测位置）的组表示取出来
+            last_positions = (batch['attention_mask']!=0).sum(dim=1)-1
+            last_group_reps = group_reps[torch.arange(bs), last_positions]
+            #calculate the gate similarity among all items in batch （cos）
+            # last_gate = gate[torch.arange(bs), last_positions].squeeze()
+            # gate_similarity = torch.matmul(F.normalize(last_gate.unsqueeze(1), dim=1),
+            #                                F.normalize(last_group_reps.unsqueeze(0), dim=1))
+            # 门控相似度高于阈值0.9作为正样本
+            # pos_mask = (gate_similarity > 0.9).float()
+            # pos_mask.fill_diagonal_(0)
+            overall_rep = torch.mean(last_group_reps, dim=1)
+            # overall_sim = torch.matmul(overall_rep, overall_rep.T)
+            # gate value and similarity
+            last_gate = gate[torch.arange(bs), last_positions]
+            # last_gate_scalar = last_gate.mean(dim=1, keepdim=True)
+            gate_norm = F.normalize(last_gate, dim=-1)
+            gate_similarity = gate_norm @ gate_norm.T
+            # id embedding
+            last_id_emb = id_embs[torch.arange(bs), last_positions]
+            id_similarity = torch.matmul(F.normalize(last_id_emb, dim=-1),
+                                         F.normalize(last_id_emb, dim=-1).T)
+            # combine weight
+            combined_sim = 0.4*gate_similarity + 0.6*id_similarity
+
+            temperature = self.group_temperature
+            logits = torch.matmul(overall_rep, overall_rep.T) / temperature
+            # 根据阈值构建标签
+            eye_mask = torch.eye(bs, device=logits.device).bool()
+            logits_masked = logits.masked_fill(eye_mask, float('-inf'))
+            pos_threshold = self.config['pos_threshold']
+            # labels = torch.zeros(bs, bs, device=overall_rep.device)
+            # labels[combined_sim>pos_threshold] = 1.0
+            labels = (combined_sim > pos_threshold).float()
+
+            #排除对角线
+            # mask=torch.eye(bs, device=overall_rep.device).bool()
+            labels[eye_mask] = 0.0
+
+            # k = max(1, bs // 10)
+            # top_idx = torch.topk(combined_sim, k=k, dim=1)
+            # pos_mask = torch.zeros_like(combined_sim, dtype=torch.bool)
+            # pos_mask.scatter(1, top_idx, True)
+            # pos_mask[eye_mask] = False
+
+            #计算对比损失
+            pos_mask = labels.bool()
+            neg_mask = ~pos_mask & ~eye_mask
+            log_probs = F.log_softmax(logits_masked, dim=1)
+            probs = log_probs.exp()
+            eps = 1e-8
+            #正样本损失
+            # pos_logits = logits[pos_mask]
+            # pos_loss = -torch.log(torch.exp(pos_logits)/
+            #                       torch.sum(torch.exp(logits), dim=1)[pos_mask.any(dim=1)]).mean()
+            if pos_mask.any():
+                pos_loss = -(log_probs[pos_mask].mean())
+            else:
+                pos_loss = torch.tensor(0.0, device=logits.device)
+            #负样本损失
+            # neg_logits = logits[neg_mask]
+            # neg_loss = -torch.log(1-torch.exp(neg_logits)/
+            #                       torch.sum(torch.exp(logits), dim=1)[neg_mask.any(dim=1)]).mean()
+            if neg_mask.any():
+                neg_loss = -(torch.log(torch.clamp(1.0 - probs[neg_mask], min=eps)).mean())
+            else:
+                neg_loss = torch.tensor(0.0, device=logits.device)
+            group_contrast_loss = pos_loss + neg_loss*0.1
+
+            #组间多样性损失
+            # group_cov = torch.matmul(last_group_reps.transpose(1,2), last_group_reps) # [bs, num_groups, num_groups]
+            # group_std = torch.std(last_group_reps, dim=[0,1])
+            # diversity_loss = -torch.mean(group)
+            group_similarity = torch.matmul(last_group_reps, last_group_reps.transpose(1,2))#[b,n,n]
+            eye_mask=torch.eye(self.num_groups,device=last_group_reps.device).bool()
+            eye_mask =eye_mask.unsqueeze(0).expand(bs, -1, -1)
+
+            off_diag_similarity = group_similarity[~eye_mask].view(bs, self.num_groups*(self.num_groups-1))
+            diversity_loss = off_diag_similarity.mean()
+            #组内一致性损失
+            attn_entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-10), dim=-1)
+            consistency_loss = -attn_entropy.mean()
+
+            # print(f"Token-level loss: {token_level_loss.item():.4f}")
+            # print(f"Group contrast loss: {group_contrast_loss.item():.4f}")
+            # print(f"Consistency loss: {consistency_loss.item():.4f}")
+            # print(f"Diversity loss: {diversity_loss.item():.4f}")
+            # print(f"Group loss weight: {self.group_loss_weight}")
+            # print(
+            #     f"Contribution: token={token_level_loss.item():.4f}, group={self.group_loss_weight * group_contrast_loss.item():.4f}")
+            #
+            # print(f"\n梯度检查:")
+            # print(f"- token_loss requires_grad: {token_level_loss.requires_grad}")
+            # print(f"- group_loss requires_grad: {group_contrast_loss.requires_grad}")
+
+            # # 3. 检查分组注意力是否有意义
+            # # 计算注意力权重的熵（平均每个码本的分配明确程度）
+            # attn_entropy_per_head = -torch.sum(attn_weights * torch.log(attn_weights + 1e-10),
+            #                                    dim=-1)  # [bs, seq_len, 128]
+            # avg_entropy = attn_entropy_per_head.mean().item()
+            # max_entropy = torch.log(torch.tensor(self.num_groups, dtype=torch.float)).item()
+            # print(f"\n注意力熵: {avg_entropy:.4f} (最大可能值: {max_entropy:.4f})")
+            # print(f"注意力明确度: {(1 - avg_entropy / max_entropy) * 100:.1f}%")
+            #
+            # # 4. 检查组表示是否有区分度
+            # group_std = torch.std(last_group_reps, dim=[0, 1]).mean().item()  # 组表示的方差
+            # print(f"\n组表示标准差: {group_std:.4f}")
+            #
+            # # 5. 检查正负样本比例
+            # pos_ratio = pos_mask.float().mean().item()
+            # print(f"正样本比例: {pos_ratio * 100:.2f}%")
+            # print("=" * 40)
+
+            # if self.training and random.random() < 0.01:  # 随机采样1%的批次打印，避免日志过多
+            #     print("\n=== combined_sim 统计监控 ===")
+            #
+            #     # 基础统计
+            #     print(f"combined_sim 形状: {combined_sim.shape}")
+            #     print(f"最小值: {combined_sim.min().item():.6f}")
+            #     print(f"平均值: {combined_sim.mean().item():.6f}")
+            #     print(f"中位数: {combined_sim.median().item():.6f}")
+            #     print(f"最大值: {combined_sim.max().item():.6f}")
+            #     print(f"标准差: {combined_sim.std().item():.6f}")
+            #
+            #     # 分布直方图（分桶统计）
+            #     bins = 20
+            #     hist = torch.histc(combined_sim.flatten(), bins=bins, min=-1.0, max=1.0)
+            #     hist_normalized = hist / hist.sum()
+            #     print("\n分布直方图 (-1.0 到 1.0):")
+            #     for i in range(bins):
+            #         bin_min = -1.0 + i * (2.0 / bins)
+            #         bin_max = -1.0 + (i + 1) * (2.0 / bins)
+            #         print(f"  [{bin_min:.2f}, {bin_max:.2f}): {hist_normalized[i].item() * 100:5.1f}%")
+            #
+            #     # 门控相似度统计
+            #     print(f"\ngate_similarity 统计:")
+            #     print(f"  最小值: {gate_similarity.min().item():.6f}")
+            #     print(f"  平均值: {gate_similarity.mean().item():.6f}")
+            #     print(f"  最大值: {gate_similarity.max().item():.6f}")
+            #
+            #     # ID相似度统计
+            #     print(f"\nid_similarity 统计:")
+            #     print(f"  最小值: {id_similarity.min().item():.6f}")
+            #     print(f"  平均值: {id_similarity.mean().item():.6f}")
+            #     print(f"  最大值: {id_similarity.max().item():.6f}")
+            #
+            #     # 检查正样本比例（使用当前阈值）
+            #     current_threshold = pos_threshold  # 假设pos_threshold已定义
+            #     pos_ratio_current = (combined_sim > current_threshold).float().mean().item()
+            #     print(f"\n当前阈值 {current_threshold} 下的正样本比例: {pos_ratio_current * 100:.2f}%")
+            #
+            #     # 测试多个阈值下的正样本比例
+            #     print("不同阈值下的正样本比例:")
+            #     thresholds = [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99]
+            #     for thresh in thresholds:
+            #         pos_ratio = (combined_sim > thresh).float().mean().item()
+            #         print(f"  阈值 {thresh}: {pos_ratio * 100:5.1f}%")
+            #
+            #     # 排除对角线后的统计
+            #     diag_mask = torch.eye(bs, dtype=torch.bool, device=combined_sim.device)
+            #     combined_sim_no_diag = combined_sim[~diag_mask].view(bs, bs - 1)
+            #     print(f"\n排除对角线后:")
+            #     print(f"  最小值: {combined_sim_no_diag.min().item():.6f}")
+            #     print(f"  平均值: {combined_sim_no_diag.mean().item():.6f}")
+            #     print(f"  最大值: {combined_sim_no_diag.max().item():.6f}")
+            #
+            #     print("=" * 50)
+
+            total_loss = token_level_loss + \
+                         self.group_loss_weight * group_contrast_loss + \
+                         self.consistency_loss_weight * consistency_loss + \
+                         0.05 * diversity_loss
+            outputs.loss = total_loss
+            # 可选：记录各项损失用于监控
+            outputs.token_loss = token_level_loss
+            outputs.group_contrast_loss = group_contrast_loss
+            outputs.consistency_loss = consistency_loss
         return outputs
 
     def build_ii_sim_mat(self, threshold=0.5, use_half=False):

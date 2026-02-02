@@ -43,6 +43,11 @@ temperature: 0.07
 num_beams: 50
 n_edges: 50
 propagation_steps: 3
+num_groups: 8
+group_temperature: 0.05
+group_loss_weight: 0.5
+consistency_loss_weight: 0.05
+pos_threshold: 0.5
 #   decoding graph construction
 chunk_size: 1024
 num_workers: 64
