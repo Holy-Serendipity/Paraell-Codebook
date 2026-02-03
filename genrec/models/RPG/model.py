@@ -87,7 +87,7 @@ class RPG(AbstractModel):
         pred_head_list = []
         for i in range(self.n_pred_head):
             # pred_head_list.append(ResBlock(self.config['n_embd']))
-            if i<64:
+            if i<128:
                 head=ResBlock(config['n_embd'])
             else:
                 head=nn.Linear(config['n_embd'], config['n_embd'])
