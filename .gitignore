@@ -7,6 +7,6 @@
 /wandb/
 /requirements.txt
 .idea
-__pycache__/
+genrec/__pycache__/
 *.py[cod]
 *$py.class
