@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import numpy as np
 from tqdm import tqdm
 from typing import List, Dict, Any, Optional, Union
 from logging import getLogger
@@ -11,7 +12,7 @@ from genrec.tokenizer import AbstractTokenizer
 from genrec.dataset import AbstractDataset
 from genrec.utils import get_config, init_seed, init_logger, init_device, log
 
-
+import wandb
 class Recommender:
     """
     Recommender class for generating batch recommendations from trained RPPG models.
@@ -60,6 +61,123 @@ class Recommender:
             self.model.generate_w_decoding_graph = False
             self.logger.info("Standard decoding enabled")
 
+    def _log_to_wandb(self, metrics: dict, step: Optional[int] = None):
+        """
+        Log metrics to wandb if wandb is initialized.
+
+        Args:
+            metrics (dict): Dictionary of metrics to log
+            step (int, optional): Step number for logging
+        """
+        if self.config.get('wandb_run') is not None:
+            try:
+                wandb.log(metrics, step=step)
+            except Exception as e:
+                self.logger.warning(f"Failed to log to wandb: {e}")
+
+    def _record_generation_metrics(self, batch_idx: int, total_batches: int,
+                                   batch_size: int, batch_time: float,
+                                   scores: Optional[torch.Tensor] = None,
+                                   predictions: Optional[torch.Tensor] = None):
+        """
+        Record batch-level generation metrics to wandb.
+
+        Args:
+            batch_idx (int): Current batch index
+            total_batches (int): Total number of batches
+            batch_size (int): Size of current batch
+            batch_time (float): Time taken for current batch in seconds
+            scores (torch.Tensor, optional): Confidence scores for predictions
+            predictions (torch.Tensor, optional): Predicted item IDs
+        """
+        metrics = {
+            'generation/batch_idx': batch_idx,
+            'generation/progress': batch_idx / max(total_batches, 1),
+            'generation/batch_size': batch_size,
+            'generation/batch_time': batch_time,
+            'generation/users_per_second': batch_size / max(batch_time, 1e-6),
+        }
+
+        # Add GPU memory usage if available
+        if torch.cuda.is_available():
+            metrics.update({
+                'generation/gpu_memory_allocated': torch.cuda.memory_allocated() / 1024 ** 3,  # GB
+                'generation/gpu_memory_reserved': torch.cuda.memory_reserved() / 1024 ** 3,  # GB
+                'generation/gpu_memory_percent': torch.cuda.memory_allocated() / max(torch.cuda.max_memory_allocated(), 1),
+            })
+
+        # Add score statistics if available
+        if scores is not None:
+            # Squeeze any extra dimensions
+            scores_flat = scores.squeeze().cpu()
+            if scores_flat.dim() == 0:
+                scores_flat = scores_flat.unsqueeze(0)
+            scores_np = scores_flat.numpy()
+            metrics.update({
+                'scores/mean': float(scores_np.mean()),
+                'scores/std': float(scores_np.std()),
+                'scores/min': float(scores_np.min()),
+                'scores/max': float(scores_np.max()),
+            })
+
+        # Add prediction statistics if available
+        if predictions is not None:
+            # Squeeze any extra dimensions
+            preds_flat = predictions.squeeze().cpu()
+            if preds_flat.dim() == 0:
+                preds_flat = preds_flat.unsqueeze(0)
+            preds_np = preds_flat.numpy()
+            unique_items = len(np.unique(preds_np))
+            metrics.update({
+                'predictions/unique_items': unique_items,
+                'predictions/diversity': unique_items / (preds_np.size if preds_np.size > 0 else 1),
+            })
+
+        self._log_to_wandb(metrics)
+
+    def _calculate_recommendation_quality(self, recommendations: List[Dict[str, Any]]) -> Dict[str, float]:
+        """
+        Calculate recommendation quality metrics.
+
+        Args:
+            recommendations (List[dict]): List of recommendation results
+
+        Returns:
+            dict: Dictionary of quality metrics
+        """
+        if not recommendations:
+            return {}
+
+        all_scores = []
+        all_item_ids = []
+
+        for rec in recommendations:
+            for item in rec['recommendations']:
+                all_scores.append(item['score'])
+                all_item_ids.append(item['item_id'])
+
+        if not all_scores:
+            return {}
+
+        scores_np = np.array(all_scores)
+        item_ids_np = np.array(all_item_ids)
+
+        metrics = {
+            'quality/score_mean': float(scores_np.mean()),
+            'quality/score_std': float(scores_np.std()),
+            'quality/score_min': float(scores_np.min()),
+            'quality/score_max': float(scores_np.max()),
+            'quality/unique_items': len(np.unique(item_ids_np)),
+            'quality/diversity': len(np.unique(item_ids_np)) / len(item_ids_np) if len(item_ids_np) > 0 else 0,
+            'quality/total_recommendations': len(all_scores),
+            'quality/total_users': len(recommendations),
+        }
+
+        # Calculate score distribution percentiles
+        for p in [10, 25, 50, 75, 90]:
+            metrics[f'quality/score_p{p}'] = float(np.percentile(scores_np, p))
+
+        return metrics
     @classmethod
     def from_checkpoint(
         cls,
@@ -134,6 +252,56 @@ class Recommender:
         # Initialize logger
         init_logger(config)
         logger = getLogger()
+
+        # Initialize wandb for recommendation generation tracking
+        if config.get('wandb_mode', 'online') != 'disabled':
+            # Set up project directory for wandb
+            project_dir = os.path.join(
+                config.get('tensorboard_log_dir', config.get('log_dir', '/tmp/')),
+                config.get('dataset', 'unknown_dataset'),
+                config.get('model', 'unknown_model')
+            )
+            os.makedirs(project_dir, exist_ok=True)
+
+            # Set wandb run name if not provided
+            wandb_run_name = config.get('wandb_run_name')
+            if wandb_run_name is None:
+                from datetime import datetime
+                wandb_run_name = f"generate-{config.get('model', 'unknown')}-{config.get('dataset', 'unknown')}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                config['wandb_run_name'] = wandb_run_name
+
+            # Initialize wandb run
+            wandb.init(
+                project=config.get('wandb_project', 'RPG-Netease'),
+                name=wandb_run_name,
+                config=config,  # Record all configuration parameters
+                dir=project_dir,  # Set wandb directory
+                resume="allow",  # Allow resume
+                mode=config.get('wandb_mode', 'online'),  # Online or offline mode
+                entity=config.get('wandb_entity'),  # Team or user name
+                tags=config.get('wandb_tags', []) + ['generation']  # Add generation tag
+            )
+
+            # Save wandb run info to config
+            config['wandb_run'] = wandb.run
+            config['wandb_run_id'] = wandb.run.id
+
+            # Record configuration to wandb
+            wandb.config.update(config)
+
+            # Create wandb config file
+            config_file_path = os.path.join(project_dir, 'config_generate.yaml')
+            with open(config_file_path, 'w') as f:
+                import yaml
+                yaml.dump(config, f)
+
+            # Upload config file to wandb
+            wandb.save(config_file_path, base_path=os.path.dirname(config_file_path))
+
+            logger.info(f"Initialized wandb run: {wandb_run_name} (ID: {wandb.run.id})")
+        else:
+            config['wandb_run'] = None
+            config['wandb_run_id'] = None
 
         # Load dataset
         from genrec.utils import get_dataset
@@ -247,10 +415,18 @@ class Recommender:
 
         all_results = []
 
+        # Calculate total batches
+        total_batches = (len(user_histories) + batch_size - 1) // batch_size
+
         # Process in batches
-        for i in tqdm(range(0, len(user_histories), batch_size), desc="Generating recommendations"):
+        # for i in tqdm(range(0, len(user_histories), batch_size), desc="Generating recommendations"):
+        for batch_idx, i in enumerate(tqdm(range(0, len(user_histories), batch_size), desc="Generating recommendations")):
             batch_histories = user_histories[i:i+batch_size]
             batch_user_ids = user_ids[i:i+batch_size]
+
+            # Record batch start time
+            import time
+            batch_start_time = time.time()
 
             # Prepare batch
             batch = self._prepare_batch(batch_histories)
@@ -268,7 +444,18 @@ class Recommender:
                 else:
                     preds = self.model.generate(batch, n_return_sequences=top_k)
                     scores = None
-
+            # Calculate batch time and record metrics
+            batch_time = time.time() - batch_start_time
+            current_batch_size = len(batch_histories)
+            # Record generation metrics to wandb
+            self._record_generation_metrics(
+                batch_idx=batch_idx,
+                total_batches=total_batches,
+                batch_size=current_batch_size,
+                batch_time=batch_time,
+                scores=scores,
+                predictions=preds
+            )
             # Process batch results
             batch_preds = preds.squeeze(-1).cpu().tolist()  # Shape: (batch_size, top_k)
             if scores is not None:
@@ -411,6 +598,46 @@ class Recommender:
 
         self.logger.info(f"Saved recommendations to {output_path}")
         self.logger.info(f"Total users: {len(recommendations)}")
+
+        # Log generation summary to wandb
+        if self.config.get('wandb_run') is not None:
+            try:
+                # Calculate recommendation quality metrics
+                quality_metrics = self._calculate_recommendation_quality(recommendations)
+
+                # Record quality metrics
+                wandb.log(quality_metrics)
+
+                # Record summary metrics
+                summary_metrics = {
+                    'generation/total_users': len(recommendations),
+                    'generation/total_recommendations': len(recommendations) * default_metadata.get('top_k', 10),
+                    'generation/output_path': output_path,
+                    'generation/checkpoint': default_metadata.get('checkpoint', 'unknown'),
+                }
+                wandb.log(summary_metrics)
+
+                # Update wandb run summary
+                for key, value in quality_metrics.items():
+                    wandb.run.summary[key] = value
+                wandb.run.summary['generation/total_users'] = len(recommendations)
+                wandb.run.summary['generation/output_path'] = output_path
+                wandb.run.summary['generation/completed_at'] = default_metadata.get('generation_time',
+                                                                                    datetime.now().isoformat())
+
+                # Save recommendations file as wandb artifact
+                artifact = wandb.Artifact(
+                    name=f"recommendations-{os.path.basename(output_path).replace('.json', '')}",
+                    type="recommendations",
+                    description=f"Generated recommendations for {len(recommendations)} users"
+                )
+                artifact.add_file(output_path)
+                wandb.log_artifact(artifact)
+
+                self.logger.info(f"Logged generation summary to wandb (run: {wandb.run.name})")
+
+            except Exception as e:
+                self.logger.warning(f"Failed to log generation summary to wandb: {e}")
 
     def _prepare_batch(self, user_histories: List[List[int]]) -> Dict[str, torch.Tensor]:
         """
