@@ -272,91 +272,6 @@ class RPG(AbstractModel):
             attn_entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-10), dim=-1)
             consistency_loss = -attn_entropy.mean()
 
-            # print(f"Token-level loss: {token_level_loss.item():.4f}")
-            # print(f"Group contrast loss: {group_contrast_loss.item():.4f}")
-            # print(f"Consistency loss: {consistency_loss.item():.4f}")
-            # print(f"Diversity loss: {diversity_loss.item():.4f}")
-            # print(f"Group loss weight: {self.group_loss_weight}")
-            # print(
-            #     f"Contribution: token={token_level_loss.item():.4f}, group={self.group_loss_weight * group_contrast_loss.item():.4f}")
-            #
-            # print(f"\n梯度检查:")
-            # print(f"- token_loss requires_grad: {token_level_loss.requires_grad}")
-            # print(f"- group_loss requires_grad: {group_contrast_loss.requires_grad}")
-
-            # # 3. 检查分组注意力是否有意义
-            # # 计算注意力权重的熵（平均每个码本的分配明确程度）
-            # attn_entropy_per_head = -torch.sum(attn_weights * torch.log(attn_weights + 1e-10),
-            #                                    dim=-1)  # [bs, seq_len, 128]
-            # avg_entropy = attn_entropy_per_head.mean().item()
-            # max_entropy = torch.log(torch.tensor(self.num_groups, dtype=torch.float)).item()
-            # print(f"\n注意力熵: {avg_entropy:.4f} (最大可能值: {max_entropy:.4f})")
-            # print(f"注意力明确度: {(1 - avg_entropy / max_entropy) * 100:.1f}%")
-            #
-            # # 4. 检查组表示是否有区分度
-            # group_std = torch.std(last_group_reps, dim=[0, 1]).mean().item()  # 组表示的方差
-            # print(f"\n组表示标准差: {group_std:.4f}")
-            #
-            # # 5. 检查正负样本比例
-            # pos_ratio = pos_mask.float().mean().item()
-            # print(f"正样本比例: {pos_ratio * 100:.2f}%")
-            # print("=" * 40)
-
-            # if self.training and random.random() < 0.01:  # 随机采样1%的批次打印，避免日志过多
-            #     print("\n=== combined_sim 统计监控 ===")
-            #
-            #     # 基础统计
-            #     print(f"combined_sim 形状: {combined_sim.shape}")
-            #     print(f"最小值: {combined_sim.min().item():.6f}")
-            #     print(f"平均值: {combined_sim.mean().item():.6f}")
-            #     print(f"中位数: {combined_sim.median().item():.6f}")
-            #     print(f"最大值: {combined_sim.max().item():.6f}")
-            #     print(f"标准差: {combined_sim.std().item():.6f}")
-            #
-            #     # 分布直方图（分桶统计）
-            #     bins = 20
-            #     hist = torch.histc(combined_sim.flatten(), bins=bins, min=-1.0, max=1.0)
-            #     hist_normalized = hist / hist.sum()
-            #     print("\n分布直方图 (-1.0 到 1.0):")
-            #     for i in range(bins):
-            #         bin_min = -1.0 + i * (2.0 / bins)
-            #         bin_max = -1.0 + (i + 1) * (2.0 / bins)
-            #         print(f"  [{bin_min:.2f}, {bin_max:.2f}): {hist_normalized[i].item() * 100:5.1f}%")
-            #
-            #     # 门控相似度统计
-            #     print(f"\ngate_similarity 统计:")
-            #     print(f"  最小值: {gate_similarity.min().item():.6f}")
-            #     print(f"  平均值: {gate_similarity.mean().item():.6f}")
-            #     print(f"  最大值: {gate_similarity.max().item():.6f}")
-            #
-            #     # ID相似度统计
-            #     print(f"\nid_similarity 统计:")
-            #     print(f"  最小值: {id_similarity.min().item():.6f}")
-            #     print(f"  平均值: {id_similarity.mean().item():.6f}")
-            #     print(f"  最大值: {id_similarity.max().item():.6f}")
-            #
-            #     # 检查正样本比例（使用当前阈值）
-            #     current_threshold = pos_threshold  # 假设pos_threshold已定义
-            #     pos_ratio_current = (combined_sim > current_threshold).float().mean().item()
-            #     print(f"\n当前阈值 {current_threshold} 下的正样本比例: {pos_ratio_current * 100:.2f}%")
-            #
-            #     # 测试多个阈值下的正样本比例
-            #     print("不同阈值下的正样本比例:")
-            #     thresholds = [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99]
-            #     for thresh in thresholds:
-            #         pos_ratio = (combined_sim > thresh).float().mean().item()
-            #         print(f"  阈值 {thresh}: {pos_ratio * 100:5.1f}%")
-            #
-            #     # 排除对角线后的统计
-            #     diag_mask = torch.eye(bs, dtype=torch.bool, device=combined_sim.device)
-            #     combined_sim_no_diag = combined_sim[~diag_mask].view(bs, bs - 1)
-            #     print(f"\n排除对角线后:")
-            #     print(f"  最小值: {combined_sim_no_diag.min().item():.6f}")
-            #     print(f"  平均值: {combined_sim_no_diag.mean().item():.6f}")
-            #     print(f"  最大值: {combined_sim_no_diag.max().item():.6f}")
-            #
-            #     print("=" * 50)
-
             total_loss = token_level_loss + \
                          self.group_loss_weight * group_contrast_loss + \
                          self.consistency_loss_weight * consistency_loss + \
@@ -716,7 +631,7 @@ class RPG(AbstractModel):
         adj_idx,_=self.build_ii_topk_adjacency(use_threshold=False, threshold=0.5, use_half=False)
         self.adjacency = adj_idx
         self.tokenizer.log("Graph initialized.")
-    def graph_propagation(self, token_logits, n_return_sequences):
+    def graph_propagation(self, token_logits, n_return_sequences, return_scores=False):
         batch_size = token_logits.shape[0]
 
         # Initialize visited nodes tracking
@@ -743,6 +658,7 @@ class RPG(AbstractModel):
             all_neighbors = self.adjacency[topk_nodes_sorted].view(batch_size, -1)
 
             next_nodes = []
+            batch_scores = []
             for batch_id in range(batch_size):
                 neighbors_in_batch = torch.unique(all_neighbors[batch_id])
 
@@ -758,14 +674,26 @@ class RPG(AbstractModel):
 
                 idxs = torch.topk(scores, self.num_beams).indices
                 next_nodes.append(neighbors_in_batch[idxs])
+                batch_scores.append(scores[idxs])
             topk_nodes_sorted = torch.stack(next_nodes, dim=0)
+            if return_scores:
+                # Keep track of scores for the final selection
+                topk_scores = torch.stack(batch_scores, dim=0)
 
         # Convert visited counts to tensor
         visited_counts = torch.FloatTensor([[len(visited_nodes[batch_id])] for batch_id in range(batch_size)])
 
-        return topk_nodes_sorted[:,:n_return_sequences].unsqueeze(-1), visited_counts
+        # Get final predictions
+        preds = topk_nodes_sorted[:, :n_return_sequences].unsqueeze(-1)
 
-    def generate(self, batch, n_return_sequences=1):
+        if return_scores:
+            # Get scores for the final predictions
+            final_scores = topk_scores[:, :n_return_sequences].unsqueeze(-1)
+            return preds, final_scores, visited_counts
+        else:
+            return preds, visited_counts
+
+    def generate(self, batch, n_return_sequences=1, return_scores=False):
         outputs = self.forward(batch, return_loss=False)
         states = outputs.final_states.gather(
             dim=1,
@@ -784,16 +712,30 @@ class RPG(AbstractModel):
             if not self.init_flag:
                 self.init_graph()
                 self.init_flag = True
-            outputs = self.graph_propagation(
-                token_logits=token_logits,
-                n_return_sequences=n_return_sequences
-            )
-            return outputs
+            if return_scores:
+                preds, scores, visited_counts = self.graph_propagation(
+                    token_logits=token_logits,
+                    n_return_sequences=n_return_sequences,
+                    return_scores=True
+                )
+                return preds, scores, visited_counts
+            else:
+                preds, visited_counts = self.graph_propagation(
+                    token_logits=token_logits,
+                    n_return_sequences=n_return_sequences,
+                    return_scores=False
+                )
+                return preds, visited_counts
         else:
             item_logits = torch.gather(
                 input=token_logits.unsqueeze(-2).expand(-1, self.dataset.n_items, -1),              # (batch_size, n_items, n_tokens)
                 dim=-1,
                 index=(self.item_id2tokens[1:,:] - 1).unsqueeze(0).expand(token_logits.shape[0], -1, -1)  # (batch_size, n_items, code_dim)
             ).mean(dim=-1)
-            preds = item_logits.topk(n_return_sequences, dim=-1).indices + 1
-            return preds.unsqueeze(-1)
+            if return_scores:
+                scores, indices = item_logits.topk(n_return_sequences, dim=-1)
+                preds = indices + 1
+                return preds.unsqueeze(-1), scores.unsqueeze(-1)
+            else:
+                preds = item_logits.topk(n_return_sequences, dim=-1).indices + 1
+                return preds.unsqueeze(-1)

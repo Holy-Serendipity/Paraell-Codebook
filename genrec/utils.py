@@ -103,13 +103,13 @@ def init_logger(config: dict):
 
     logging.basicConfig(level=logging.INFO, handlers=[sh, fh])
 
-    if not config['accelerator'].is_main_process:
+    if config['accelerator'] is not None and not config['accelerator'].is_main_process:
         from datasets.utils.logging import disable_progress_bar
         disable_progress_bar()
 
 
 def log(message, accelerator, logger, level='info'):
-    if accelerator.is_main_process:
+    if accelerator.is_main_process or accelerator is None:
         if level == 'info':
             logger.info(message)
         elif level == 'error':
@@ -140,8 +140,8 @@ def get_tokenizer(model_name: str):
             importlib.import_module(f'genrec.models.{model_name}.tokenizer'),
             f'{model_name}Tokenizer'
         )
-    except:
-        raise ValueError(f'Tokenizer for model "{model_name}" not found.')
+    except Exception as e:
+        raise ValueError(f'Tokenizer for model "{model_name}" not found. Original error: {e}')
     return tokenizer_class
 
 

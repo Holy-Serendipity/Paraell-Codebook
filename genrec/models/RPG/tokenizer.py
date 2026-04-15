@@ -9,8 +9,17 @@ import faiss.contrib.torch
 from genrec.dataset import AbstractDataset
 from genrec.tokenizer import AbstractTokenizer
 from FlagEmbedding import BGEM3FlagModel
-import vllm
-from vllm import LLM
+try:
+    import vllm
+    from vllm import LLM
+    HAS_VLLM = True
+except Exception as e:
+    vllm = None
+    LLM = None
+    HAS_VLLM = False
+    # Log a warning but don't raise - vllm may not be needed for all embedding models
+    import warnings
+    warnings.warn(f"vllm import failed: {e}. This may not affect functionality if not using vllm-based embedding models.")
 class RPGTokenizer(AbstractTokenizer):
     """
     An example when "codebook_size == 256, n_codebooks == 32":

@@ -25,3 +25,11 @@ patience: 20            # Early stopping. Stop training after n epochs without i
 topk: [5,10,200]
 metrics: [ndcg,recall]
 val_metric: ndcg@10
+
+# Recommendation generation settings
+recommendation:
+  top_k: 10                    # Number of recommendations per user
+  include_scores: true         # Whether to include confidence scores in output
+  output_format: json          # Output format for recommendations
+  use_graph_decoding: false    # Use graph-constrained decoding for generation
+  batch_size: 256              # Batch size for recommendation generation

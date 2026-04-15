@@ -5,3 +5,4 @@
 # LICENSE file in the root directory of this source tree.
 
 from genrec.models.RPG.model import RPG
+from genrec.models.RPG.tokenizer import RPGTokenizer

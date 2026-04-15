@@ -12,6 +12,7 @@ from genrec.model import AbstractModel
 from genrec.tokenizer import AbstractTokenizer
 from genrec.utils import get_config, init_seed, init_logger, init_device, \
     get_dataset, get_tokenizer, get_model, get_trainer, log
+from genrec.recommender import Recommender
 import wandb
 
 class Pipeline:
@@ -230,3 +231,64 @@ class Pipeline:
 
     def log(self, message, level='info'):
         return log(message, self.config['accelerator'], self.logger, level=level)
+
+    def generate_recommendations(self, output_path, top_k=10, include_scores=True,
+                                use_graph_decoding=False, batch_size=256,
+                                user_subset=None):
+        """
+        Generate recommendations using the trained model.
+
+        Args:
+            output_path (str): Path to output JSON file
+            top_k (int): Number of recommendations per user
+            include_scores (bool): Whether to include confidence scores
+            use_graph_decoding (bool): Whether to use graph-constrained decoding
+            batch_size (int): Batch size for inference
+            user_subset (list): Optional list of user IDs to generate for
+
+        Returns:
+            dict: Dictionary containing generation statistics
+        """
+        self.log(f"Generating recommendations with top_k={top_k}, include_scores={include_scores}")
+
+        # Create recommender instance using current pipeline components
+        recommender = Recommender(
+            config=self.config,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            dataset=self.raw_dataset
+        )
+
+        # Generate recommendations
+        recommendations = recommender.generate_from_test_set(
+            top_k=top_k,
+            include_scores=include_scores,
+            batch_size=batch_size,
+            user_subset=user_subset
+        )
+
+        # Save recommendations
+        metadata = {
+            "generated_by": "Pipeline.generate_recommendations",
+            "model": self.config.get('model', 'RPG'),
+            "dataset": self.config.get('dataset', 'Netease'),
+            "checkpoint": self.checkpoint_path,
+            "top_k": top_k,
+            "include_scores": include_scores,
+            "use_graph_decoding": use_graph_decoding,
+        }
+
+        recommender.save_recommendations(recommendations, output_path, metadata)
+
+        stats = {
+            "total_users": len(recommendations),
+            "top_k": top_k,
+            "output_path": output_path,
+            "include_scores": include_scores,
+            "use_graph_decoding": use_graph_decoding,
+        }
+
+        self.log(f"Generated recommendations for {len(recommendations)} users")
+        self.log(f"Output saved to: {output_path}")
+
+        return stats
