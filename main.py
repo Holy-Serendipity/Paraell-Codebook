@@ -33,6 +33,12 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=256,
                         help='Batch size for recommendation generation (generate mode only)')
 
+    # Post-training/evaluation recommendation generation
+    parser.add_argument('--generate_recommendations', action='store_true',
+                        help='Generate and save recommendations for test users after training/evaluation')
+    parser.add_argument('--recommendations_output', type=str, default='recommendations.json',
+                        help='Output file for recommendations when using --generate_recommendations')
+
     return parser.parse_known_args()
 
 def load_user_list(user_list_file):
@@ -78,13 +84,43 @@ def main():
         if args.mode == 'train':
             results = pipeline.run()
         else:  # evaluate mode
-            # For evaluate mode, we need to load the model and run evaluation
-            results = pipeline.run()
+            # Evaluate only mode - load checkpoint and evaluate without training
+            results = pipeline.evaluate_only()
 
         print(f"\n{args.mode.capitalize()} completed.")
         if 'test_results' in results:
             print("Test results:", results['test_results'])
-
+        # Generate recommendations after training/evaluation if requested
+        if args.generate_recommendations:
+            print(f"\nGenerating recommendations for test users...")
+            print(f"  Output: {args.recommendations_output}")
+            print(f"  Top-K: {args.top_k}")
+            print(f"  Include scores: {args.include_scores}")
+            print(f"  Graph decoding: {args.use_graph_decoding}")
+            # Load user list if provided
+            user_subset = None
+            if args.user_list:
+                try:
+                    user_subset = load_user_list(args.user_list)
+                    print(f"  User subset: {len(user_subset)} users from {args.user_list}")
+                except Exception as e:
+                    print(f"ERROR: Failed to load user list: {e}")
+                    sys.exit(1)
+            try:
+                # Use pipeline's generate_recommendations method
+                gen_stats = pipeline.generate_recommendations(
+                    output_path=args.recommendations_output,
+                    top_k=args.top_k,
+                    include_scores=args.include_scores,
+                    use_graph_decoding=args.use_graph_decoding,
+                    batch_size=args.batch_size,
+                    user_subset=user_subset
+                )
+                print(f"\nSuccessfully generated recommendations for {gen_stats['total_users']} users")
+                print(f"Output saved to: {gen_stats['output_path']}")
+            except Exception as e:
+                print(f"ERROR: Failed to generate recommendations: {e}")
+                sys.exit(1)
     elif args.mode == 'generate':
         # Recommendation generation mode
         if not args.checkpoint:

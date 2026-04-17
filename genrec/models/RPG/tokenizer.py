@@ -47,9 +47,34 @@ class RPGTokenizer(AbstractTokenizer):
         self.index_factory = f'OPQ{config["n_codebook"]},IVF1,PQ{config["n_codebook"]}x{self.n_codebook_bits}'
 
         super(RPGTokenizer, self).__init__(config, dataset)
+        # Debug dataset structure
+        # self.log(f'[TOKENIZER] Dataset structure check:')
+        # self.log(
+        #     f'[TOKENIZER]  - has item2id: {hasattr(dataset, "item2id")}, type: {type(getattr(dataset, "item2id", None))}')
+        # self.log(
+        #     f'[TOKENIZER]  - has user2id: {hasattr(dataset, "user2id")}, type: {type(getattr(dataset, "user2id", None))}')
+        # self.log(
+        #     f'[TOKENIZER]  - has id_mapping: {hasattr(dataset, "id_mapping")}, value: {getattr(dataset, "id_mapping", None)}')
+
+        if hasattr(dataset, 'id_mapping') and dataset.id_mapping is not None:
+            self.log(f'[TOKENIZER]  - id_mapping keys: {list(dataset.id_mapping.keys())}')
+            if 'id2item' in dataset.id_mapping:
+                self.log(f'[TOKENIZER]  - id2item type: {type(dataset.id_mapping["id2item"])}')
+                if hasattr(dataset.id_mapping['id2item'], '__len__'):
+                    self.log(f'[TOKENIZER]  - id2item length: {len(dataset.id_mapping["id2item"])}')
         self.item2id = dataset.item2id
         self.user2id = dataset.user2id
+        # Check id_mapping before accessing
+        if not hasattr(dataset, 'id_mapping') or dataset.id_mapping is None:
+            raise ValueError("Dataset.id_mapping is None or not present. Cannot initialize tokenizer.")
+
+        if 'id2item' not in dataset.id_mapping:
+            raise ValueError("Dataset.id_mapping does not contain 'id2item' key. Available keys: " + str(
+                list(dataset.id_mapping.keys())))
         self.id2item = dataset.id_mapping['id2item']
+        self.log(
+            f'[TOKENIZER] Successfully set id2item (type: {type(self.id2item)}, length: {len(self.id2item) if hasattr(self.id2item, "__len__") else "N/A"})')
+
         self.item2tokens = self._init_tokenizer(dataset)
         self.eos_token = self.n_digit * self.codebook_size + 1
         self.ignored_label = -100
@@ -209,6 +234,11 @@ class RPGTokenizer(AbstractTokenizer):
         Returns:
             np.ndarray: A boolean mask indicating which items are used for training.
         """
+        # Check if split_data exists
+        if dataset.split_data is None or 'train' not in dataset.split_data:
+            # For inference/generation mode, use all items for FAISS training
+            self.log(f'[TOKENIZER] No training data found, using all items for FAISS training')
+            return np.ones(dataset.n_items - 1, dtype=bool)
         items_for_training = set()
         for item_seq in dataset.split_data['train']['item_seq']:
             for item in item_seq:
@@ -228,24 +258,60 @@ class RPGTokenizer(AbstractTokenizer):
             sem_ids_path (str): Path to save the generated semantic IDs.
             train_mask (numpy.ndarray): Boolean mask indicating the training samples.
         """
-        if self.config['opq_use_gpu']:
-            res = faiss.StandardGpuResources()
-            res.setTempMemory(1024 * 1024 * 512)
-            co = faiss.GpuClonerOptions()
-            co.useFloat16 = self.n_digit >= 56
-        faiss.omp_set_num_threads(self.config['faiss_omp_num_threads'])
+        # if self.config['opq_use_gpu']:
+        use_gpu = self.config.get('opq_use_gpu', False)
+        gpu_initialized = False
+        res = None
+        co = None
+
+        # Check if GPU FAISS is available
+        if use_gpu:
+            if hasattr(faiss, 'StandardGpuResources'):
+                try:
+                    self.log(f'[TOKENIZER] GPU FAISS available, initializing...')
+                    res = faiss.StandardGpuResources()
+                    res.setTempMemory(1024 * 1024 * 512)
+                    if hasattr(faiss, 'GpuClonerOptions'):
+                        co = faiss.GpuClonerOptions()
+                        co.useFloat16 = self.n_digit >= 56
+                    gpu_initialized = True
+                    self.log(f'[TOKENIZER] GPU FAISS initialized successfully')
+                except Exception as e:
+                    self.log(f'[TOKENIZER] GPU FAISS initialization failed: {e}, falling back to CPU mode')
+                    use_gpu = False
+                    gpu_initialized = False
+                    # Update config to avoid future GPU attempts
+                    self.config['opq_use_gpu'] = False
+                    self.log(f'[TOKENIZER] Updated config: opq_use_gpu = False')
+            else:
+                self.log(f'[TOKENIZER] GPU FAISS not available (no StandardGpuResources), falling back to CPU mode')
+                use_gpu = False
+                # Update config to avoid future GPU attempts
+                self.config['opq_use_gpu'] = False
+                self.log(f'[TOKENIZER] Updated config: opq_use_gpu = False')
+
+        faiss.omp_set_num_threads(self.config.get('faiss_omp_num_threads', 4))
         index = faiss.index_factory(
             sent_embs.shape[1],
             self.index_factory,
             faiss.METRIC_INNER_PRODUCT
         )
-        self.log(f'[TOKENIZER] Training index...')
-        if self.config['opq_use_gpu']:
-            index = faiss.index_cpu_to_gpu(res, self.config['opq_gpu_id'], index, co)
+        self.log(f'[TOKENIZER] Training index... (GPU: {use_gpu})')
+        if use_gpu and gpu_initialized and res is not None:
+            try:
+                index = faiss.index_cpu_to_gpu(res, self.config.get('opq_gpu_id', 0), index, co)
+                self.log(f'[TOKENIZER] Index moved to GPU successfully')
+            except Exception as e:
+                self.log(f'[TOKENIZER] Failed to move index to GPU: {e}, falling back to CPU')
+                use_gpu = False
         index.train(sent_embs[train_mask])
         index.add(sent_embs)
-        if self.config['opq_use_gpu']:
-            index = faiss.index_gpu_to_cpu(index)
+        if use_gpu and gpu_initialized and res is not None:
+            try:
+                index = faiss.index_gpu_to_cpu(index)
+                self.log(f'[TOKENIZER] Index moved back to CPU successfully')
+            except Exception as e:
+                self.log(f'[TOKENIZER] Failed to move index back to CPU: {e}, continuing with GPU index')
 
         ivf_index = faiss.downcast_index(index.index)
         invlists = faiss.extract_index_ivf(ivf_index).invlists
@@ -264,9 +330,30 @@ class RPGTokenizer(AbstractTokenizer):
         pq_codes = np.array(faiss_sem_ids)
 
         item2sem_ids = {}
+        self.log(f'[TOKENIZER] Generating semantic IDs for {pq_codes.shape[0]} items')
+        self.log(
+            f'[TOKENIZER] id2item type: {type(self.id2item)}, length: {len(self.id2item) if hasattr(self.id2item, "__len__") else "N/A"}')
+
+        if self.id2item is None:
+            raise ValueError("self.id2item is None. Cannot map FAISS codes to items.")
+
+        if not isinstance(self.id2item, (dict, list, tuple)):
+            raise ValueError(f"self.id2item is not subscriptable. Type: {type(self.id2item)}")
         for i in range(pq_codes.shape[0]):
-            item = self.id2item[i + 1]
-            item2sem_ids[item] = tuple(pq_codes[i].tolist())
+            # item = self.id2item[i + 1]
+            item_id = i + 1
+            if item_id >= len(self.id2item):
+                self.log(
+                    f'[TOKENIZER] Warning: item_id {item_id} out of range for id2item (len={len(self.id2item)}), skipping')
+                continue
+            try:
+                item = self.id2item[item_id]
+                item2sem_ids[item] = tuple(pq_codes[i].tolist())
+            except (KeyError, IndexError) as e:
+                self.log(f'[TOKENIZER] Error accessing id2item[{item_id}]: {e}', level='warning')
+                # Try to create a placeholder item ID
+                placeholder_item = f"item_{item_id}"
+                item2sem_ids[placeholder_item] = tuple(pq_codes[i].tolist())
         self.log(f'[TOKENIZER] Saving semantic IDs to {sem_ids_path}...')
         with open(sem_ids_path, 'w') as f:
             json.dump(item2sem_ids, f)
@@ -299,41 +386,82 @@ class RPGTokenizer(AbstractTokenizer):
         Returns:
             dict: A dictionary mapping items to semantic IDs.
         """
-        # Load semantic IDs
-        sem_ids_path = os.path.join(
-            dataset.cache_dir, 'processed', f'{self.config["n_codebook"]}-{self.n_codebook_bits}',
-            f'{os.path.basename(self.config["sent_emb_model"])}_{self.index_factory}.sem_ids'
-        )
+        try:
+            # Log relevant config keys for debugging
+            relevant_keys = ['sent_emb_model', 'sent_emb_dim', 'sent_emb_pca', 'sent_emb_batch_size',
+                             'n_codebook', 'codebook_size', 'device', 'metadata']
+            config_info = {k: self.config.get(k, 'NOT SET') for k in relevant_keys}
+            self.log(f'[TOKENIZER] Config for tokenizer init: {config_info}')
 
-        if not os.path.exists(sem_ids_path):
-            # Load or encode sentence embeddings
-            sent_emb_path = os.path.join(
-                dataset.cache_dir, 'processed',
-                f'{os.path.basename(self.config["sent_emb_model"])}.sent_emb'
+            # Debug dataset structure
+            self.log(
+                f'[TOKENIZER] Dataset info: n_items={dataset.n_items}, has split_data={dataset.split_data is not None}')
+            if hasattr(dataset, 'id_mapping'):
+                self.log(f'[TOKENIZER] Dataset has id_mapping: {dataset.id_mapping is not None}')
+                if dataset.id_mapping is not None:
+                    self.log(f'[TOKENIZER] id_mapping keys: {list(dataset.id_mapping.keys())}')
+
+            # Load semantic IDs
+            sem_ids_path = os.path.join(
+                dataset.cache_dir, 'processed', f'{self.config["n_codebook"]}-{self.n_codebook_bits}',
+                f'{os.path.basename(self.config["sent_emb_model"])}_{self.index_factory}.sem_ids'
             )
-            if os.path.exists(sent_emb_path):
-                self.log(f'[TOKENIZER] Loading sentence embeddings from {sent_emb_path}...')
-                sent_embs = np.fromfile(sent_emb_path, dtype=np.float32).reshape(-1, self.config['sent_emb_dim'])
-            else:
-                self.log(f'[TOKENIZER] Encoding sentence embeddings...')
-                sent_embs = self._encode_sent_emb(dataset, sent_emb_path)
-            # PCA
-            if self.config['sent_emb_pca'] > 0:
-                self.log(f'[TOKENIZER] Applying PCA to sentence embeddings...')
-                from sklearn.decomposition import PCA
-                pca = PCA(n_components=self.config['sent_emb_pca'], whiten=True)
-                sent_embs = pca.fit_transform(sent_embs)
-            self.log(f'[TOKENIZER] Sentence embeddings shape: {sent_embs.shape}')
+            self.log(f'[TOKENIZER] Semantic IDs path: {sem_ids_path}')
+            self.log(f'[TOKENIZER] Semantic IDs file exists: {os.path.exists(sem_ids_path)}')
 
-            # Generate semantic IDs
-            training_item_mask = self._get_items_for_training(dataset)
-            self._generate_semantic_id_opq(sent_embs, sem_ids_path, training_item_mask)
+            if not os.path.exists(sem_ids_path):
+                # Load or encode sentence embeddings
+                sent_emb_path = os.path.join(
+                    dataset.cache_dir, 'processed',
+                    f'{os.path.basename(self.config["sent_emb_model"])}.sent_emb'
+                )
+                self.log(f'[TOKENIZER] Sentence embeddings path: {sent_emb_path}')
+                self.log(f'[TOKENIZER] Sentence embeddings file exists: {os.path.exists(sent_emb_path)}')
 
-        self.log(f'[TOKENIZER] Loading semantic IDs from {sem_ids_path}...')
-        item2sem_ids = json.load(open(sem_ids_path, 'r'))
-        item2tokens = self._sem_ids_to_tokens(item2sem_ids)
+                if os.path.exists(sent_emb_path):
+                    self.log(f'[TOKENIZER] Loading sentence embeddings from {sent_emb_path}...')
+                    # Check if sent_emb_dim is in config
+                    if 'sent_emb_dim' not in self.config or self.config['sent_emb_dim'] is None:
+                        # Try to infer dimension from file size and number of items
+                        file_size = os.path.getsize(sent_emb_path)
+                        n_items = dataset.n_items - 1  # item IDs start from 1
+                        if n_items > 0:
+                            inferred_dim = file_size // (n_items * 4)  # 4 bytes per float32
+                            self.config['sent_emb_dim'] = inferred_dim
+                            self.log(
+                                f'[TOKENIZER] Inferred sent_emb_dim: {inferred_dim} from file size {file_size} and {n_items} items')
+                        else:
+                            raise ValueError("Cannot infer sent_emb_dim: n_items is 0")
+                    sent_embs = np.fromfile(sent_emb_path, dtype=np.float32).reshape(-1, self.config['sent_emb_dim'])
+                else:
+                    self.log(f'[TOKENIZER] Encoding sentence embeddings...')
+                    sent_embs = self._encode_sent_emb(dataset, sent_emb_path)
+                # PCA
+                if self.config['sent_emb_pca'] > 0:
+                    self.log(f'[TOKENIZER] Applying PCA to sentence embeddings...')
+                    from sklearn.decomposition import PCA
+                    pca = PCA(n_components=self.config['sent_emb_pca'], whiten=True)
+                    sent_embs = pca.fit_transform(sent_embs)
+                self.log(f'[TOKENIZER] Sentence embeddings shape: {sent_embs.shape}')
 
-        return item2tokens
+                # Generate semantic IDs
+                training_item_mask = self._get_items_for_training(dataset)
+                self.log(
+                    f'[TOKENIZER] Training item mask shape: {training_item_mask.shape}, sum: {training_item_mask.sum()}')
+                self._generate_semantic_id_opq(sent_embs, sem_ids_path, training_item_mask)
+
+            self.log(f'[TOKENIZER] Loading semantic IDs from {sem_ids_path}...')
+            item2sem_ids = json.load(open(sem_ids_path, 'r'))
+            self.log(f'[TOKENIZER] Loaded {len(item2sem_ids)} semantic IDs')
+            item2tokens = self._sem_ids_to_tokens(item2sem_ids)
+
+            return item2tokens
+
+        except Exception as e:
+            self.log(f'[TOKENIZER] Error in _init_tokenizer: {str(e)}', level='error')
+            import traceback
+            self.log(f'[TOKENIZER] Traceback: {traceback.format_exc()}', level='error')
+            raise
 
     def _tokenize_first_n_items(self, item_seq: list) -> tuple:
         """

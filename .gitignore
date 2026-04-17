@@ -10,3 +10,5 @@
 genrec/__pycache__/
 *.py[cod]
 *$py.class
+/recommendations.json
+ genrec/models/RPG/__pycache__/

@@ -83,6 +83,12 @@ The system consists of several key components:
    pip install faiss-gpu
    ```
 
+4. (Optional) Create cache directory for faster recommendation generation:
+   ```bash
+   mkdir -p ./cache
+   ```
+   This directory will store cached adjacency matrices and embeddings for faster subsequent runs, especially important when using graph-constrained decoding.
+
 ## Usage
 
 ### 1. Prepare Dataset
@@ -116,7 +122,10 @@ The pipeline automatically evaluates on test set after training. Metrics include
 
 ### 5. Generate Recommendations for Online Testing
 
-After training, you can generate batch recommendations for online A/B testing:
+RPPG provides flexible options for generating recommendations for online A/B testing:
+
+#### Generate Mode (Standalone)
+Generate recommendations from a trained checkpoint:
 
 ```bash
 # Generate recommendations from test set
@@ -131,22 +140,98 @@ python main.py --mode generate --checkpoint /path/to/model.pth \
 python main.py --mode generate --checkpoint /path/to/model.pth \
   --include_scores --output recommendations.json
 
-# Use graph-constrained decoding
+# Use graph-constrained decoding (caches adjacency matrix for faster subsequent runs)
 python main.py --mode generate --checkpoint /path/to/model.pth \
   --use_graph_decoding --output recommendations.json
 
 # Generate for specific user list (one user ID per line)
 python main.py --mode generate --checkpoint /path/to/model.pth \
   --user_list users.txt --output recommendations.json
+
+# Advanced: combine multiple options
+python main.py --mode generate --checkpoint /path/to/model.pth \
+  --top_k 10 --include_scores --use_graph_decoding \
+  --batch_size 256 --output recommendations.json
 ```
+
+#### Post-Training/Evaluation Generation
+Generate recommendations automatically after training or evaluation:
+
+```bash
+# Train model and generate recommendations for test users
+python main.py --mode train --model RPG --dataset Netease \
+  --generate_recommendations --recommendations_output train_recommendations.json
+
+# Evaluate existing model and generate recommendations
+python main.py --mode evaluate --model RPG --dataset Netease \
+  --checkpoint /path/to/model.pth --generate_recommendations \
+  --recommendations_output eval_recommendations.json
+```
+
+**Note on Graph-Decoding**: When using `--use_graph_decoding`, the item-item similarity matrix is cached to disk (in the cache directory) for faster subsequent runs. The first run may take several hours for large datasets.
 
 **Output Format:**
 The generated JSON file contains:
-- `metadata`: Model information, generation parameters, and timestamp
-- `recommendations`: List of recommendations per user, each with:
-  - `user_id`: User identifier
-  - `user_history`: User's interaction history
-  - `recommendations`: List of recommended items with scores and ranks
+
+**Metadata Section:**
+- `model`: Model name (e.g., "RPG")
+- `dataset`: Dataset name (e.g., "Netease")
+- `checkpoint`: Checkpoint path used for generation
+- `generation_time`: ISO timestamp of generation
+- `top_k`: Number of recommendations per user
+- `include_scores`: Whether scores are included
+- `use_graph_decoding`: Whether graph-constrained decoding was used
+- `total_users`: Number of users in the recommendations
+
+**Recommendations Section:**
+List of recommendations per user, each containing:
+- `user_id`: User identifier (string)
+- `user_history`: User's interaction history (list of original item IDs)
+- `recommendations`: List of recommended items, each with:
+  - `item_id`: Original item ID (not token ID)
+  - `score`: Confidence score (log probability, negative values expected)
+  - `rank`: Position in recommendation list (1-based)
+
+**Score Interpretation:**
+- **Negative values are normal**: Scores are log probabilities from `log_softmax`
+- **Higher values are better**: -5.5 is better than -5.6 (closer to 0)
+- **Probability conversion**: `probability = exp(score)` (e.g., -5.5 ≈ 0.004 probability)
+- **Range**: Typically between -10 and 0 for well-trained models
+
+**Example Output:**
+```json
+{
+  "metadata": {
+    "model": "RPG",
+    "dataset": "Netease",
+    "checkpoint": "/path/to/model.pth",
+    "generation_time": "2026-04-16T18:16:36",
+    "top_k": 10,
+    "include_scores": true,
+    "use_graph_decoding": true,
+    "total_users": 1000
+  },
+  "recommendations": [
+    {
+      "user_id": "72509001127",
+      "user_history": [3063102, 3148501, 3543592, ...],
+      "recommendations": [
+        {"item_id": 3297408, "score": -5.537, "rank": 1},
+        {"item_id": 3499714, "score": -5.541, "rank": 2},
+        ...
+      ]
+    }
+  ]
+}
+```
+
+**Weights & Biases Integration:**
+Recommendation generation automatically logs to wandb when enabled, including:
+- Generation progress and timing
+- GPU memory usage
+- Score statistics (mean, std, distribution)
+- Recommendation diversity metrics
+- Output file as wandb artifact
 
 **Standalone Script:**
 For batch recommendation generation, you can also use the standalone script:
@@ -183,6 +268,10 @@ python scripts/generate_recommendations.py \
 - `output_format`: Output format for recommendations (default: json)
 - `use_graph_decoding`: Use graph-constrained decoding for generation (default: false)
 - `batch_size`: Batch size for recommendation generation (default: 256)
+- `cache_dir`: Directory for caching adjacency matrices and embeddings (default: `./cache/`)
+- `wandb_mode`: Weights & Biases mode for generation tracking (`online`, `offline`, `disabled`)
+- `wandb_project`: W&B project name for generation runs
+- `wandb_entity`: W&B entity (team/username) for generation runs
 
 ### Embedding Models
 
@@ -202,15 +291,36 @@ Supported embedding models:
 
 ### Recommendation Generation
 
+#### Online Testing Pipeline
+RPPG includes a comprehensive recommendation generation system for online A/B testing:
+
+1. **Batch Processing**: Generates recommendations for test users or specified user lists in batches
+2. **Flexible Output**: JSON format with metadata, user history, and scored recommendations
+3. **Progress Tracking**: Real-time progress display and wandb integration for monitoring
+4. **Caching System**: Adjacency matrices are cached to disk for fast subsequent runs
+
+#### Generation Process
 1. **Sequence Encoding**: User interaction history is converted to semantic IDs and mean-pooled.
 2. **Transformer Processing**: The GPT-2 model processes the sequence to predict the next item's semantic IDs.
 3. **Decoding**: Either:
    - **Direct Decoding**: Select items with highest probability over semantic IDs
    - **Graph-Constrained Decoding**: Use item-item similarity graph to guide beam search
+4. **Post-processing**: Convert token IDs back to original item IDs, compute confidence scores
+5. **Output Generation**: Format results as JSON with metadata and wandb logging
+
+#### Performance Optimizations
+- **Adjacency Matrix Caching**: Graph structures saved to `cache_dir` for reuse
+- **Batch Processing**: Configurable batch size for memory-efficient generation
+- **GPU Memory Management**: Automatic handling of large recommendation batches
+- **Wandb Integration**: Comprehensive metrics tracking for generation runs
 
 ### Graph Construction
 
-Item-item similarity is computed based on semantic ID agreement, forming a graph used during decoding to improve recommendation coherence.
+Item-item similarity is computed based on semantic ID agreement, forming a graph used during decoding to improve recommendation coherence. The adjacency matrix is:
+- **Computed once** for each dataset configuration
+- **Cached to disk** for fast loading in subsequent runs
+- **Memory efficient** using sparse tensor representation
+- **Automatically loaded** when `--use_graph_decoding` is enabled
 
 ## Results
 
@@ -235,6 +345,10 @@ If you use this code in your research, please cite:
   year={2025}
 }
 ```
+
+## Troubleshooting
+
+For common issues and solutions, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## License
 

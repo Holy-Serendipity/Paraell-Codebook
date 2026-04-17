@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 from transformers import GPT2Config, GPT2Model
 
 from genrec.dataset import AbstractDataset
@@ -627,9 +628,40 @@ class RPG(AbstractModel):
     #     self.adjacency = self.build_adjacency_list(item_item_sim)
     #     self.tokenizer.log("Graph initialized.")
     def init_graph(self):
-        self.tokenizer.log("Building item-item similarity matrix...")
+        # Check if adjacency matrix is already initialized
+        if hasattr(self, 'adjacency') and self.adjacency is not None:
+            self.tokenizer.log("Graph already initialized, skipping...")
+            return
+
+        # Try to load cached adjacency matrix
+        cache_dir = self.config.get('cache_dir', self.config.get('log_dir', './cache'))
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Generate cache filename based on dataset and model parameters
+        dataset_name = self.config.get('dataset', 'unknown')
+        n_items = self.dataset.n_items
+        cache_file = os.path.join(cache_dir, f"adjacency_{dataset_name}_items{n_items}.pt")
+
+        if os.path.exists(cache_file):
+            self.tokenizer.log(f"Loading cached adjacency matrix from {cache_file}")
+            try:
+                self.adjacency = torch.load(cache_file, map_location=self.config['device'])
+                self.tokenizer.log("Graph initialized from cache.")
+                return
+            except Exception as e:
+                self.tokenizer.log(f"Failed to load cached adjacency matrix: {e}, rebuilding...")
+
+        # Build adjacency matrix
+        self.tokenizer.log("Building item-item similarity matrix... (this may take a while)")
         adj_idx,_=self.build_ii_topk_adjacency(use_threshold=False, threshold=0.5, use_half=False)
         self.adjacency = adj_idx
+
+        # Save to cache for future use
+        try:
+            torch.save(self.adjacency, cache_file)
+            self.tokenizer.log(f"Saved adjacency matrix to cache: {cache_file}")
+        except Exception as e:
+            self.tokenizer.log(f"Failed to save adjacency matrix to cache: {e}")
         self.tokenizer.log("Graph initialized.")
     def graph_propagation(self, token_logits, n_return_sequences, return_scores=False):
         batch_size = token_logits.shape[0]

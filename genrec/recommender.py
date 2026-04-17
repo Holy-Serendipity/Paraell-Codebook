@@ -321,8 +321,8 @@ class Recommender:
 
         # Load checkpoint
         if os.path.exists(checkpoint_path):
-            model.load_state_dict(torch.load(checkpoint_path, map_location=config['device']))
-            logger.info(f"Loaded model checkpoint from {checkpoint_path}")
+            model.load_state_dict(torch.load(checkpoint_path, map_location=config['device']), strict=False)
+            logger.info(f"Loaded model checkpoint from {checkpoint_path} (strict=False due to architecture changes)")
         else:
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
@@ -351,15 +351,33 @@ class Recommender:
         with torch.no_grad():
             # Generate recommendations
             if include_scores:
-                # Use return_scores if available, otherwise generate and compute scores separately
-                if hasattr(self.model, 'generate_with_scores'):
-                    preds, scores = self.model.generate_with_scores(batch, n_return_sequences=top_k)
-                elif hasattr(self.model.generate, '__code__') and 'return_scores' in self.model.generate.__code__.co_varnames:
-                    preds, scores = self.model.generate(batch, n_return_sequences=top_k, return_scores=True)
-                else:
-                    # Fallback: generate without scores
+                try:
+                    # Use return_scores if available, otherwise generate and compute scores separately
+                    if hasattr(self.model, 'generate_with_scores'):
+                        preds, scores = self.model.generate_with_scores(batch, n_return_sequences=top_k)
+                    elif hasattr(self.model.generate,
+                                 '__code__') and 'return_scores' in self.model.generate.__code__.co_varnames:
+                        # Try standard unpacking first
+                        try:
+                            preds, scores = self.model.generate(batch, n_return_sequences=top_k, return_scores=True)
+                        except ValueError as e:
+                            if "too many values to unpack" in str(e):
+                                # Graph decoding returns 3 values: preds, scores, visited_counts
+                                preds, scores, visited_counts = self.model.generate(batch, n_return_sequences=top_k,
+                                                                                    return_scores=True)
+                                self.logger.debug(
+                                    f"Graph decoding: received visited_counts shape {visited_counts.shape}")
+                            else:
+                                raise e
+                    else:
+                        # Fallback: generate without scores
+                        preds = self.model.generate(batch, n_return_sequences=top_k)
+                        scores = torch.ones_like(preds, dtype=torch.float32)  # Placeholder scores
+                except Exception as e:
+                    self.logger.error(f"Error generating recommendations with scores: {e}")
+                    # Fallback without scores
                     preds = self.model.generate(batch, n_return_sequences=top_k)
-                    scores = torch.ones_like(preds, dtype=torch.float32)  # Placeholder scores
+                    scores = torch.ones_like(preds, dtype=torch.float32)
             else:
                 preds = self.model.generate(batch, n_return_sequences=top_k)
                 scores = None
@@ -371,11 +389,13 @@ class Recommender:
         else:
             score_list = [1.0] * len(recommendations)  # Default scores
 
-        # Format recommendations
+        # Format recommendations - convert token IDs back to item IDs
         rec_items = []
-        for i, (item_id, score) in enumerate(zip(recommendations, score_list)):
+        for i, (token_id, score) in enumerate(zip(recommendations, score_list)):
+            # Convert token ID back to item ID
+            item_id = self._token_id_to_item_id(int(token_id))
             rec_items.append({
-                "item_id": int(item_id),
+                "item_id": item_id,
                 "score": float(score),
                 "rank": i + 1
             })
@@ -434,11 +454,30 @@ class Recommender:
             with torch.no_grad():
                 # Generate recommendations for batch
                 if include_scores:
-                    if hasattr(self.model, 'generate_with_scores'):
-                        preds, scores = self.model.generate_with_scores(batch, n_return_sequences=top_k)
-                    elif hasattr(self.model.generate, '__code__') and 'return_scores' in self.model.generate.__code__.co_varnames:
-                        preds, scores = self.model.generate(batch, n_return_sequences=top_k, return_scores=True)
-                    else:
+                    try:
+                        # Try to get scores - handle both standard and graph decoding
+                        if hasattr(self.model, 'generate_with_scores'):
+                            preds, scores = self.model.generate_with_scores(batch, n_return_sequences=top_k)
+                        elif hasattr(self.model.generate,
+                                     '__code__') and 'return_scores' in self.model.generate.__code__.co_varnames:
+                            # Try standard unpacking first
+                            try:
+                                preds, scores = self.model.generate(batch, n_return_sequences=top_k, return_scores=True)
+                            except ValueError as e:
+                                if "too many values to unpack" in str(e):
+                                    # Graph decoding returns 3 values: preds, scores, visited_counts
+                                    preds, scores, visited_counts = self.model.generate(batch, n_return_sequences=top_k,
+                                                                                        return_scores=True)
+                                    self.logger.debug(
+                                        f"Graph decoding: received visited_counts shape {visited_counts.shape}")
+                                else:
+                                    raise e
+                        else:
+                            preds = self.model.generate(batch, n_return_sequences=top_k)
+                            scores = torch.ones_like(preds, dtype=torch.float32)
+                    except Exception as e:
+                        self.logger.error(f"Error generating recommendations with scores: {e}")
+                        # Fallback without scores
                         preds = self.model.generate(batch, n_return_sequences=top_k)
                         scores = torch.ones_like(preds, dtype=torch.float32)
                 else:
@@ -468,8 +507,10 @@ class Recommender:
             ):
                 rec_items = []
                 for rank, (item_id, score) in enumerate(zip(pred_list, score_list), 1):
+                    # Convert token ID to original item ID
+                    original_item_id = self._token_id_to_item_id(int(item_id))
                     rec_items.append({
-                        "item_id": int(item_id),
+                        "item_id": original_item_id if isinstance(original_item_id, int) else int(original_item_id),
                         "score": float(score),
                         "rank": rank
                     })
@@ -535,14 +576,72 @@ class Recommender:
         user_histories = []
         user_ids = []
 
-        for example in test_dataset:
-            user_seq = example['item_seq']
+        for idx, example in enumerate(test_dataset):
+            if idx < 3:  # Debug first 3 examples
+                self.logger.info(f"[DEBUG] Example {idx} keys: {list(example.keys())}")
+
+            # item_seq may be nested: [[item1, item2, ...]] as in tokenizer
+            item_seq_data = example['item_seq']
+            if idx < 3:
+                self.logger.info(f"[DEBUG] item_seq type: {type(item_seq_data)}, content preview: {str(item_seq_data)[:100]}")
+            # Handle various item_seq formats
+            user_seq = []
+            if isinstance(item_seq_data, list):
+                if len(item_seq_data) > 0:
+                    if isinstance(item_seq_data[0], list):
+                        # Nested list format: [[item1, item2, ...]]
+                        user_seq = item_seq_data[0]
+                        if idx < 3:
+                            self.logger.info(f"[DEBUG] Nested list detected, using first element, len: {len(user_seq)}")
+                    else:
+                        # Flat list format: [item1, item2, ...]
+                        user_seq = item_seq_data
+                        if idx < 3:
+                            self.logger.info(f"[DEBUG] Flat list detected, len: {len(user_seq)}")
+            elif isinstance(item_seq_data, str):
+                # Try to parse as JSON string
+                try:
+                    parsed = json.loads(item_seq_data)
+                    if isinstance(parsed, list):
+                        user_seq = parsed
+                        if idx < 3:
+                            self.logger.info(f"[DEBUG] Parsed JSON string, len: {len(user_seq)}")
+                    else:
+                        self.logger.warning(f"Parsed JSON is not a list: {type(parsed)}")
+                except json.JSONDecodeError:
+                    self.logger.warning(f"Failed to parse item_seq as JSON: {item_seq_data[:50]}...")
+            else:
+                self.logger.warning(f"Unexpected item_seq format: {type(item_seq_data)}")
+
+            # Ensure all items are integers
+            cleaned_seq = []
+            for item_idx, item in enumerate(user_seq):
+                if isinstance(item, (int, np.integer)):
+                    cleaned_seq.append(int(item))
+                elif isinstance(item, str):
+                    try:
+                        cleaned_seq.append(int(item))
+                    except ValueError:
+                        self.logger.warning(f"Failed to convert item '{item}' (position {item_idx}) to int, skipping")
+                elif isinstance(item, float):
+                    # Try to convert float to int if it's actually an integer
+                    if item.is_integer():
+                        cleaned_seq.append(int(item))
+                    else:
+                        self.logger.warning(f"Float item {item} at position {item_idx} is not integer, skipping")
+                else:
+                    self.logger.warning(f"Unexpected item type {type(item)} at position {item_idx}: {item}, skipping")
+
+            if idx < 3 and cleaned_seq:
+                self.logger.info(f"[DEBUG] Cleaned seq first 5 items: {cleaned_seq[:5]}")
+                self.logger.info(f"[DEBUG] Cleaned seq types: {[type(x) for x in cleaned_seq[:5]]}")
             user_id = example['user'] if 'user' in example else len(user_ids) + 1
-            user_histories.append(user_seq)
+            user_histories.append(cleaned_seq)
             user_ids.append(user_id)
 
         self.logger.info(f"Generating recommendations for {len(user_histories)} test users")
 
+        # Generate recommendations using the main generation function
         return self.generate_for_users(
             user_histories=user_histories,
             user_ids=user_ids,
@@ -550,6 +649,40 @@ class Recommender:
             include_scores=include_scores,
             batch_size=batch_size
         )
+
+    def _token_id_to_item_id(self, token_id: int) -> int:
+        """
+        Convert token ID back to original item ID.
+        Args:
+            token_id (int): Token ID from model output (1-based token IDs)
+        Returns:
+            int: Original item ID
+        """
+        # token_id 0 is padding, should not appear in predictions
+        if token_id == 0:
+            self.logger.warning(f"Padding token (0) found in predictions")
+            return 0
+        # Check if tokenizer has id2item mapping
+        if hasattr(self.tokenizer, 'id2item') and self.tokenizer.id2item is not None:
+            # id2item is 0-indexed list mapping token_id to original item ID
+            # Model outputs 1-based token IDs (1 to n_items)
+            # So we need to subtract 1 to index into id2item
+            idx = token_id - 1
+            if 0 <= idx < len(self.tokenizer.id2item):
+                item = self.tokenizer.id2item[idx]
+                # Try to convert to integer if possible
+                try:
+                    return int(item)
+                except (ValueError, TypeError):
+                    return item
+            else:
+                self.logger.warning(f"Token ID {token_id} (idx={idx}) out of range for id2item (len={len(self.tokenizer.id2item)})")
+                # Fallback: try direct lookup if token_id is already original item ID
+                return token_id
+        else:
+            # Fallback: assume token_id is item_id (for backward compatibility)
+            self.logger.debug(f"No id2item mapping available, using token_id as item_id")
+            return token_id
 
     def save_recommendations(
         self,
@@ -649,6 +782,29 @@ class Recommender:
         Returns:
             dict: Batch dictionary for model input
         """
+        # Debug: check input format and tokenizer mapping
+        if len(user_histories) > 0:
+            self.logger.info(f"[DEBUG] _prepare_batch: processing {len(user_histories)} histories")
+
+            # Check tokenizer mapping
+            if hasattr(self.tokenizer, 'item2id'):
+                self.logger.info(f"[DEBUG] Tokenizer item2id type: {type(self.tokenizer.item2id)}")
+                # Check first few keys
+                keys = list(self.tokenizer.item2id.keys())
+                if len(keys) > 0:
+                    self.logger.info(f"[DEBUG] First 3 item2id keys: {keys[:3]}, types: {[type(k) for k in keys[:3]]}")
+                    self.logger.info(f"[DEBUG] First 3 item2id values: {[self.tokenizer.item2id[k] for k in keys[:3]]}")
+                # Check if tokenizer has vocab_size
+                if hasattr(self.tokenizer, 'vocab_size'):
+                    self.logger.info(f"[DEBUG] Tokenizer vocab_size: {self.tokenizer.vocab_size}")
+            for i, history in enumerate(user_histories[:3]):  # Check first 3
+                self.logger.info(f"[DEBUG]   History {i}: type={type(history)}, len={len(history) if hasattr(history, '__len__') else 'N/A'}")
+                if len(history) > 0:
+                    self.logger.info(f"[DEBUG]     First element: type={type(history[0])}, value={history[0]}")
+                    # Check if all elements are int
+                    non_int = [item for item in history if not isinstance(item, (int, np.integer))]
+                    if non_int:
+                        self.logger.warning(f"[DEBUG]     Non-integer elements found: {non_int[:5]}...")
         max_seq_len = self.config.get('max_item_seq_len', 50)
 
         all_input_ids = []
@@ -659,11 +815,39 @@ class Recommender:
         for history in user_histories:
             # Use the tokenizer's tokenization logic
             # For inference, we want to predict next item given history
-            if len(history) >= max_seq_len + 1:
+            # Convert item IDs to token IDs using tokenizer mapping
+            tokenized_history = []
+            for item_id in history:
+                # Map item_id to token_id
+                # Note: tokenizer expects item IDs as keys, not indices
+                item_str = str(item_id)  # tokenizer可能使用字符串item ID
+                token_id = None
+
+                # Try string key first (most common)
+                if item_str in self.tokenizer.item2id:
+                    token_id = self.tokenizer.item2id[item_str]
+                # Fallback: try integer key
+                elif item_id in self.tokenizer.item2id:
+                    token_id = self.tokenizer.item2id[item_id]
+                else:
+                    # Unknown item, use padding token (0) as fallback
+                    self.logger.warning(f"Item {item_id} not found in tokenizer.item2id, using padding token")
+                    token_id = 0
+
+                # Check if token_id is within valid range for items
+                # token_id should be between 0 (padding) and len(id2item)-1 (last item)
+                if hasattr(self.tokenizer, 'id2item') and self.tokenizer.id2item is not None:
+                    max_item_id = len(self.tokenizer.id2item)  # n_items, id2item indices: 0 to n_items-1
+                    if token_id >= max_item_id and token_id != 0:
+                        self.logger.error(
+                            f"Token ID {token_id} exceeds max item ID {max_item_id - 1}, using padding token")
+                        token_id = 0
+                tokenized_history.append(token_id)
+            if len(tokenized_history) >= max_seq_len + 1:
                 # Truncate to max_seq_len + 1 (last item is target)
-                truncated_history = history[-(max_seq_len + 1):]
+                truncated_history = tokenized_history[-(max_seq_len + 1):]
             else:
-                truncated_history = history
+                truncated_history = tokenized_history
 
             # Prepare input sequence (all but last item)
             input_seq = truncated_history[:-1]
@@ -684,12 +868,43 @@ class Recommender:
             all_labels.append(labels)
             all_seq_lens.append(seq_len)
 
-        # Convert to tensors
+        # Convert to tensors with validation
+        try:
+            input_ids_tensor = torch.tensor(all_input_ids, dtype=torch.long)
+        except Exception as e:
+            self.logger.error(f"Failed to create input_ids tensor: {e}")
+            self.logger.error(
+                f"all_input_ids sample (first 3): {all_input_ids[:3] if len(all_input_ids) >= 3 else all_input_ids}")
+            # Check for non-integer values
+            for i, seq in enumerate(all_input_ids[:5]):
+                non_int = [item for item in seq if not isinstance(item, (int, np.integer))]
+                if non_int:
+                    self.logger.error(
+                        f"  Sequence {i} has non-integer values at indices: {[j for j, item in enumerate(seq) if not isinstance(item, (int, np.integer))][:10]}")
+            raise
+
+        try:
+            attention_mask_tensor = torch.tensor(all_attention_mask, dtype=torch.long)
+        except Exception as e:
+            self.logger.error(f"Failed to create attention_mask tensor: {e}")
+            raise
+
+        try:
+            labels_tensor = torch.tensor(all_labels, dtype=torch.long)
+        except Exception as e:
+            self.logger.error(f"Failed to create labels tensor: {e}")
+            raise
+
+        try:
+            seq_lens_tensor = torch.tensor(all_seq_lens, dtype=torch.long)
+        except Exception as e:
+            self.logger.error(f"Failed to create seq_lens tensor: {e}")
+            raise
         batch = {
-            'input_ids': torch.tensor(all_input_ids, dtype=torch.long).to(self.device),
-            'attention_mask': torch.tensor(all_attention_mask, dtype=torch.long).to(self.device),
-            'labels': torch.tensor(all_labels, dtype=torch.long).to(self.device),
-            'seq_lens': torch.tensor(all_seq_lens, dtype=torch.long).to(self.device)
+            'input_ids': input_ids_tensor.to(self.device),
+            'attention_mask': attention_mask_tensor.to(self.device),
+            'labels': labels_tensor.to(self.device),
+            'seq_lens': seq_lens_tensor.to(self.device)
         }
 
         return batch

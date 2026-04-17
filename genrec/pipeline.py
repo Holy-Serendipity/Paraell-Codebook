@@ -108,8 +108,9 @@ class Pipeline:
         with self.accelerator.main_process_first():
             self.model = get_model(model_name)(self.config, self.raw_dataset, self.tokenizer)
             if checkpoint_path is not None:
-                self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.config['device']))
-                self.log(f'Loaded model checkpoint from {checkpoint_path}')
+                self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.config['device']),
+                                           strict=False)
+                self.log(f'Loaded model checkpoint from {checkpoint_path} (strict=False due to architecture changes)')
         self.log(self.model)
         self.log(self.model.n_parameters)
 
@@ -168,7 +169,7 @@ class Pipeline:
         self.accelerator.wait_for_everyone()
         self.model = self.accelerator.unwrap_model(self.model)
         if self.checkpoint_path is None:
-            self.model.load_state_dict(torch.load(self.trainer.saved_model_ckpt))
+            self.model.load_state_dict(torch.load(self.trainer.saved_model_ckpt), strict=False)
 
             if self.accelerator.is_main_process and self.config.get('wandb_run'):
                 wandb.log({'info/best_model_loaded': 1})
@@ -249,7 +250,13 @@ class Pipeline:
         Returns:
             dict: Dictionary containing generation statistics
         """
-        self.log(f"Generating recommendations with top_k={top_k}, include_scores={include_scores}")
+        self.log(
+            f"Generating recommendations with top_k={top_k}, include_scores={include_scores}, use_graph_decoding={use_graph_decoding}")
+
+        # Update config for graph decoding
+        self.config['use_graph_decoding'] = use_graph_decoding
+        # Also set model flag directly
+        self.model.generate_w_decoding_graph = use_graph_decoding
 
         # Create recommender instance using current pipeline components
         recommender = Recommender(
@@ -292,3 +299,55 @@ class Pipeline:
         self.log(f"Output saved to: {output_path}")
 
         return stats
+
+    def evaluate_only(self):
+        """
+        Evaluate the model on test set without training.
+        Useful for evaluating a pre-trained checkpoint.
+
+        Returns:
+            dict: Evaluation results
+        """
+        # Prepare test dataloader
+        test_dataloader = DataLoader(
+            self.tokenized_datasets['test'],
+            batch_size=self.config['eval_batch_size'],
+            shuffle=False,
+            collate_fn=self.tokenizer.collate_fn['test']
+        )
+
+        # Load model checkpoint if provided
+        if self.checkpoint_path is not None:
+            self.model.load_state_dict(torch.load(self.checkpoint_path, map_location=self.config['device']),
+                                       strict=False)
+            self.log(f'Loaded model checkpoint from {self.checkpoint_path} (strict=False due to architecture changes)')
+
+        # Prepare model and dataloader with accelerator
+        self.model, test_dataloader = self.accelerator.prepare(
+            self.model, test_dataloader
+        )
+
+        # Enable graph-constrained decoding for model inference
+        self.trainer.model.generate_w_decoding_graph = True
+
+        # Evaluate
+        test_results = self.trainer.evaluate(test_dataloader)
+
+        # Log results
+        if self.accelerator.is_main_process:
+            for key in test_results:
+                self.accelerator.log({f'Test_Metric/{key}': test_results[key]})
+
+                if self.config.get('wandb_run'):
+                    wandb.run.summary[f"test/{key}"] = test_results[key]
+
+        self.log(f'Test Results: {test_results}')
+
+        # Log to wandb summary
+        if self.accelerator.is_main_process and self.config.get('wandb_run'):
+            for key, value in test_results.items():
+                wandb.run.summary[f"best_test/{key}"] = value
+
+        return {
+            'test_results': test_results,
+        }
