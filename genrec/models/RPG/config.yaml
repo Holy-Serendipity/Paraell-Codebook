@@ -51,3 +51,22 @@ pos_threshold: 0.5
 #   decoding graph construction
 chunk_size: 1024
 num_workers: 64
+
+# Swing algorithm configs
+use_swing: false              # 是否使用swing算法
+swing_weight: 0.5             # swing相似度权重（0-1）
+swing_alpha: 1.0              # swing算法平滑参数
+swing_min_cooccurrence: 2     # 最小共同出现次数阈值
+swing_cache: true             # 是否缓存swing相似度矩阵
+swing_sim_type: jaccard       # Swing相似度类型：exact（精确Swing）、jaccard（Jaccard近似）
+sim_type: semantic            # 相似度类型：semantic（语义相似度）、embedding（nn.Embedding相似度）、fusion（融合语义和swing）
+
+# Swing语义ID增强配置
+use_swing_enhancement: false          # 是否使用Swing增强语义ID
+swing_enhance_weight: 0.3             # Swing增强权重（0-1）
+swing_neighbors: 10                   # 用于增强的邻居数量
+swing_enhance_type: additive          # 增强类型：additive/multiplicative/gated
+swing_enhance_cache: true             # 是否缓存增强结果
+
+# 兼容性配置
+use_item_id_embedding: false          # 是否使用item-id embedding（默认禁用）
