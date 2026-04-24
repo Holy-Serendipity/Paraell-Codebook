@@ -68,9 +68,6 @@ class Pipeline:
             self.config['wandb_run'] = wandb.run
             self.config['wandb_run_id'] = wandb.run.id
 
-            # 记录配置信息到 wandb
-            wandb.config.update(self.config)
-
             # 创建 wandb 的配置文件
             config_file_path = os.path.join(self.project_dir, 'config.yaml')
             with open(config_file_path, 'w') as f:
@@ -112,15 +109,6 @@ class Pipeline:
         self.log(self.model)
         self.log(self.model.n_parameters)
 
-        # 记录模型信息到 wandb
-        if self.accelerator.is_main_process and self.config.get('wandb_run'):
-            wandb.log({
-                'model/parameters': self.model.n_parameters,
-                'model/architecture': str(type(self.model)),
-                # 'dataset/size': self.config['dataset_size'],
-                # 'dataset/classes': len(self.config['dataset_classes'])
-            })
-
         # Trainer
         if trainer is not None:
             self.trainer = trainer
@@ -133,6 +121,8 @@ class Pipeline:
             self.tokenized_datasets['train'],
             batch_size=self.config['train_batch_size'],
             shuffle=True,
+            num_workers=0,
+            pin_memory=False,
             collate_fn=self.tokenizer.collate_fn['train']
         )
         val_dataloader = DataLoader(
@@ -148,21 +138,7 @@ class Pipeline:
             collate_fn=self.tokenizer.collate_fn['test']
         )
 
-        if self.accelerator.is_main_process and self.config.get('wandb_run'):
-            wandb.log({
-                'data/train_batches': len(train_dataloader),
-                'data/val_batches': len(val_dataloader),
-                'data/test_batches': len(test_dataloader),
-                'data/train_batch_size': self.config['train_batch_size'],
-                'data/eval_batch_size': self.config['eval_batch_size']
-            })
-
         best_epoch, best_val_score = self.trainer.fit(train_dataloader, val_dataloader)
-
-        if self.accelerator.is_main_process and self.config.get('wandb_run'):
-            # 保存到 wandb 的摘要
-            wandb.run.summary["best_epoch"] = best_epoch
-            wandb.run.summary["best_val_score"] = best_val_score
 
         self.accelerator.wait_for_everyone()
         self.model = self.accelerator.unwrap_model(self.model)
@@ -170,7 +146,6 @@ class Pipeline:
             self.model.load_state_dict(torch.load(self.trainer.saved_model_ckpt))
 
             if self.accelerator.is_main_process and self.config.get('wandb_run'):
-                wandb.log({'info/best_model_loaded': 1})
                 # 保存最佳模型到 wandb（可选）
                 try:
                     artifact = wandb.Artifact(
@@ -197,29 +172,20 @@ class Pipeline:
             for key in test_results:
                 self.accelerator.log({f'Test_Metric/{key}': test_results[key]})
 
-                if self.config.get('wandb_run'):
-                    # wandb's abstract
-                    wandb.run.summary[f"test/{key}"] = test_results[key]
-
         self.log(f'Test Results: {test_results}')
-        #记录完整的训练摘要到wandb
+
         if self.accelerator.is_main_process and self.config.get('wandb_run'):
             for key, value in test_results.items():
-                wandb.run.summary[f"best_test/{key}"] = value
-
-            # 记录完整的训练摘要
+                wandb.run.summary[f"test/{key}"] = value
             wandb.run.summary.update({
                 "best_epoch": best_epoch,
                 "best_val_score": best_val_score,
-                "train_batch_size": self.config['train_batch_size'],
-                "eval_batch_size": self.config['eval_batch_size'],
-                "model_parameters": self.model.n_parameters,
                 "completion_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             })
 
         self.trainer.end()
 
-        if self.accelerator.is_main_process and self.config.get('wandb_run') and wandb.run is not None:
+        if self.accelerator.is_main_process and self.config.get('wandb_run'):
             wandb.finish()
 
         return {
