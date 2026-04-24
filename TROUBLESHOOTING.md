@@ -1,313 +1,166 @@
 # RPPG Troubleshooting Guide
 
-## Common Issues and Solutions
+## Setup Issues
 
-### 1. Circular Import Error
-
-**Error Message:**
+### Circular Import Error
 ```
-Traceback (most recent call last):
-  File "/root/PycharmProjects/parade/main.py", line 5, in <module>
-    from genrec.pipeline import Pipeline
-  File "/root/PycharmProjects/parade/genrec/pipeline.py", line 15, in <module>
-    from genrec.recommender import Recommender
-  File "/root/PycharmProjects/parade/genrec/recommender.py", line 13, in <module>
-    from genrec.pipeline import Pipeline
-ImportError: cannot import name 'Pipeline' from partially initialized module 'genrec.pipeline' (most likely due to a circular import)
+ImportError: cannot import name 'Pipeline' from partially initialized module 'genrec.pipeline'
+```
+**Cause**: Circular dependency between `pipeline.py` and `recommender.py`.
+
+**Fix**: Ensure `genrec/recommender.py` does not import `Pipeline` from `genrec.pipeline`. Clear cache:
+```bash
+find . -name "*.pyc" -delete && find . -name "__pycache__" -type d -exec rm -rf {} +
+python -c "from genrec.pipeline import Pipeline; print('OK')"
 ```
 
-**Cause:**
-Circular dependency between `genrec/pipeline.py` and `genrec/recommender.py`.
+### ModuleNotFoundError: No module named 'genrec'
+**Fix**: Run from project root or add to PYTHONPATH:
+```bash
+export PYTHONPATH=/path/to/Paraell-Codebook:$PYTHONPATH
+cd /path/to/Paraell-Codebook && python main.py ...
+```
 
-**Solution:**
-1. **Verify the fix is applied:** Ensure `genrec/recommender.py` does NOT contain `from genrec.pipeline import Pipeline` on line 13.
-2. **Check for __init__.py:** Ensure `genrec/__init__.py` exists.
-3. **Clean Python cache:**
-   ```bash
-   find . -name "*.pyc" -delete
-   find . -name "__pycache__" -type d -exec rm -rf {} +
-   ```
-4. **Test the fix:**
-   ```bash
-   python -c "from genrec.pipeline import Pipeline; print('Import successful')"
-   ```
+### Missing Embedding Model
+```
+ModuleNotFoundError: No module named 'FlagEmbedding'
+```
+Config specifies `sent_emb_model: /data/models/Qwen3-Embedding-4B` by default.
 
-**Code Fix Applied:**
-- Removed unnecessary import of `Pipeline` from `genrec/recommender.py`
-- Added `genrec/__init__.py` to make `genrec` a proper Python package
+**Fixes**:
+- Download the model to the configured path
+- Switch to an auto-downloading model: `sent_emb_model: BAAI/bge-large-zh-v1.5`
+- Install dependencies: `pip install sentence-transformers FlagEmbedding`
 
-### 2. Missing Data Files
+## Data Issues
 
-**Error Symptoms:**
-- `FileNotFoundError` when trying to load dataset
-- Dataset processing fails
-
-**Required Files for Netease Dataset:**
+### FileNotFoundError for Data Files
+**Required structure** for Netease:
 ```
 /data/cache/Netease/raw/
-├── data_likes.csv    # User-item interactions
-└── data_items.csv    # Item metadata
+├── data_likes.csv    # role_id,work_id,ts
+└── data_items.csv    # item_id,metadata
 ```
 
-**File Formats:**
-
-**data_likes.csv:**
-```csv
-role_id,work_id,ts
-user1,item1,2023-01-01 10:30:00
-user1,item2,2023-01-02 14:20:00
-user2,item3,2023-01-03 09:15:00
+**For testing**, create minimal samples:
+```bash
+mkdir -p /data/cache/Netease/raw/
+echo -e "role_id,work_id,ts\nuser1,item1,2023-01-01" > /data/cache/Netease/raw/data_likes.csv
+echo -e "item_id,metadata\nitem1,Test Song" > /data/cache/Netease/raw/data_items.csv
 ```
 
-**data_items.csv:**
-```csv
-item_id,metadata
-item1,Song Name - Artist Name
-item2,Movie Title - Director Name
-item3,Product Description
-```
+## Training Issues
 
-**Solutions:**
-1. **Place data files:** Copy your data files to the correct directory
-2. **Create test data:** For testing, create minimal sample files:
-   ```bash
-   mkdir -p /data/cache/Netease/raw/
-   echo "role_id,work_id,ts" > /data/cache/Netease/raw/data_likes.csv
-   echo "user1,item1,2023-01-01 10:30:00" >> /data/cache/Netease/raw/data_likes.csv
-   echo "user1,item2,2023-01-02 14:20:00" >> /data/cache/Netease/raw/data_likes.csv
-   
-   echo "item_id,metadata" > /data/cache/Netease/raw/data_items.csv
-   echo "item1,Test Song - Test Artist" >> /data/cache/Netease/raw/data_items.csv
-   echo "item2,Test Movie - Test Director" >> /data/cache/Netease/raw/data_items.csv
+### CUDA Unknown Error / DataLoader Freeze
+```
+RuntimeError: CUDA error: unknown error
+— or —
+AcceleratorError: CUDA error: unknown error
+```
+**Cause**: On Linux, PyTorch's DataLoader uses `fork` by default. Forking after CUDA initialization creates child processes with corrupted CUDA context. This occurs when `num_workers > 0` with CUDA.
+
+**Fixes** (pick one):
+1. **No multiprocessing** (simple, no data parallelism):
+   ```python
+   DataLoader(..., num_workers=0, pin_memory=False)
    ```
+2. **Spawn mode** (data parallelism works):
+   ```python
+   import torch.multiprocessing
+   DataLoader(..., num_workers=4, multiprocessing_context='spawn', pin_memory=False)
+   ```
+3. **Set `num_workers=0`** in `genrec/pipeline.py` (already the default in current code).
 
-### 3. Missing Model Checkpoint
+### CUDA Out of Memory
+**Fixes**:
+- Reduce `train_batch_size` in `config.yaml`
+- Reduce `eval_batch_size`
+- Lower `n_embd` or `n_layer` in model config
 
-**Error Message:**
+### Training Stalls at 0% (CPU 98%, GPU 0%)
+**Cause**: Swing enhancement precomputation on first forward pass (one-time cost: ~55s for 212k items).
+
+**Fix**: Wait for precompletion, or manually trigger before training:
+```python
+model.swing_enhancement.precompute_topk_neighbors()
+```
+
+### No Improvement with Swing Enhancement
+- Start with small weight (`swing_enhance_weight: 0.1`)
+- Verify similarity matrix contains meaningful values
+- Check logs for `[SwingEnhancement]` messages confirming enhancement is active
+
+## Generation Issues
+
+### Missing Model Checkpoint
 ```
 FileNotFoundError: Checkpoint file not found: /path/to/model.pth
 ```
+**Fixes**: Train first (`python main.py --mode train --model RPG --dataset Netease`), then use the checkpoint saved to `ckpt_dir`.
 
-**Solutions:**
-1. **Use existing checkpoint:** Specify correct path to trained model
-   ```bash
-   python main.py --mode generate --checkpoint /output/ckpt/best_model.pth
-   ```
-2. **Train a model first:**
-   ```bash
-   python main.py --mode train --model RPG --dataset Netease
-   ```
-3. **Check checkpoint directory:** Models are saved to `ckpt_dir` in config (default: `/output/ckpt/`)
+### Scores Are All Negative
+**Expected**: Scores are log probabilities from `log_softmax` — always ≤ 0. Higher (closer to 0) is better. Convert to probability: `exp(score)`.
 
-### 4. Missing Embedding Model
+### Output Shows Small Numbers (1, 2, 3) Instead of Item IDs
+**Cause**: Token IDs not converted back to original item IDs.
 
-**Error Symptoms:**
-- `ModuleNotFoundError` for sentence-transformers, FlagEmbedding, etc.
-- Error loading embedding model
+**Fix**: Check that `_token_id_to_item_id()` in `genrec/recommender.py` maps correctly.
 
-**Required Models:**
-The configuration (`genrec/models/RPG/config.yaml`) specifies:
-```yaml
-sent_emb_model: /data/models/Qwen3-Embedding-4B
+### Slow First Run with Graph Decoding
+Building the item-item similarity matrix is expensive for large datasets. The adjacency matrix is cached to `./cache/` after first build — subsequent runs load in seconds.
+
+### too many values to unpack (expected 2)
+**Cause**: Graph-constrained decoding returns 3 values, standard returns 2. Latest code handles both — update to the current version.
+
+## Swing Algorithm Issues
+
+### Memory Exhaustion
 ```
+Killed
+```
+- Use Jaccard approximation: `swing_sim_type: jaccard`
+- Ensure `use_sparse: true` in config
+- Increase swap space for 500k+ items
 
-**Solutions:**
-1. **Download model:** Download the embedding model to specified path
-2. **Change model:** Edit config to use a different model:
-   ```yaml
-   # Use BGE model (automatically downloads)
-   sent_emb_model: BAAI/bge-large-zh-v1.5
-   
-   # Use SentenceTransformer model
-   sent_emb_model: all-MiniLM-L6-v2
-   ```
-3. **Install dependencies:**
-   ```bash
-   pip install sentence-transformers FlagEmbedding
-   ```
+### Slow Similarity Computation
+Jaccard is 10-100x faster than exact Swing. Similarity matrices are cached to disk automatically after first computation.
 
-### 5. Memory Issues (GPU/CPU)
+### Device Mismatch
+```
+RuntimeError: Expected all tensors to be on the same device
+```
+Latest code handles device transfer automatically. If persisting, force CPU for similarity matrices: set `device='cpu'` in `swing.py` initialization.
 
-**Error Symptoms:**
-- `CUDA out of memory`
-- Process killed due to memory limits
+## GPU Issues
 
-**Solutions:**
-1. **Reduce batch size:**
-   ```bash
-   python main.py --mode generate --batch_size 64
-   ```
-2. **Use CPU:**
-   ```bash
-   # Force CPU usage
-   export CUDA_VISIBLE_DEVICES=""
-   python main.py --mode generate
-   ```
-3. **Limit users:** Generate for subset of users
-   ```bash
-   echo "user1\nuser2\nuser3" > users.txt
-   python main.py --mode generate --user_list users.txt
-   ```
+### GPU Not Utilized
+- Check `torch.cuda.is_available()` returns True
+- Default batch size 8192 for precomputation — may need tuning for your GPU
+- Code falls back to CPU automatically if GPU memory insufficient
 
-### 6. Command Line Arguments Error
+### CUDA Out of Memory During Precomputation
+- Reduce `batch_size` in `precompute_topk_neighbors()` in `genrec/models/RPG/model.py`
+- Force CPU: set `use_gpu = False` in the same method
+- Clear cache: `torch.cuda.empty_cache()`
 
-**Error Symptoms:**
-- `ArgumentError` for invalid arguments
-- Missing required arguments
+## Diagnostics
 
-**Correct Usage:**
 ```bash
-# Minimum required for generate mode
-python main.py --mode generate \
-  --checkpoint /path/to/model.pth \
-  --output recommendations.json
-
-# All available options
-python main.py --mode generate \
-  --model RPG \
-  --dataset Netease \
-  --checkpoint /path/to/model.pth \
-  --top_k 10 \
-  --include_scores \
-  --use_graph_decoding \
-  --batch_size 256 \
-  --user_list users.txt \
-  --output recommendations.json
-```
-
-### 7. Recommendation Generation Issues
-
-#### Issue 7.1: "too many values to unpack (expected 2)"
-**Error Message:**
-```
-ERROR: Failed to generate recommendations: too many values to unpack (expected 2)
-```
-
-**Cause:**
-Graph-constrained decoding returns 3 values `(preds, scores, visited_counts)` while standard decoding returns 2 values `(preds, scores)`.
-
-**Solution:**
-Code already handles this automatically. If you see this error, ensure you have the latest version with the fix in `genrec/recommender.py` lines 439-458.
-
-#### Issue 7.2: Negative Confidence Scores
-**Observation:**
-Recommendation scores are negative values (e.g., -5.5, -5.6).
-
-**Explanation:**
-This is **normal and expected**. Scores are log probabilities from `log_softmax`:
-- Negative values: log probabilities are always ≤ 0
-- Higher is better: -5.5 is better than -5.6 (closer to 0)
-- Probability: `exp(score)` gives actual probability (e.g., -5.5 ≈ 0.004)
-
-**Usage for A/B testing:**
-You can directly use these scores for ranking and comparison.
-
-#### Issue 7.3: Slow First Run with Graph Decoding
-**Observation:**
-First run with `--use_graph_decoding` takes hours.
-
-**Explanation:**
-Building the item-item similarity matrix is computationally expensive for large datasets.
-
-**Solution:**
-- Matrix is cached to disk after first build
-- Subsequent runs load from cache
-- Cache location: `cache_dir` in config (default: `./cache/`)
-- Cache file: `adjacency_{dataset}_items{n_items}.pt`
-
-#### Issue 7.4: Token ID vs Item ID Confusion
-**Observation:**
-Output contains very small numbers (1, 2, 3) instead of original item IDs.
-
-**Cause:**
-Model outputs token IDs which need conversion to original item IDs.
-
-**Solution:**
-Ensure `_token_id_to_item_id()` method in `genrec/recommender.py` is working correctly. Latest code handles this automatically.
-
-#### Issue 7.5: CUDA Memory Errors During Generation
-**Error Message:**
-```
-CUDA out of memory
-```
-
-**Solutions:**
-1. Reduce batch size: `--batch_size 64`
-2. Process fewer users at once: use `--user_list` with subset
-3. Use CPU: `export CUDA_VISIBLE_DEVICES=""`
-4. Clear GPU cache: `torch.cuda.empty_cache()`
-
-### 8. Import Errors for genrec Module
-
-**Error Message:**
-```
-ModuleNotFoundError: No module named 'genrec'
-```
-
-**Solutions:**
-1. **Add project root to PYTHONPATH:**
-   ```bash
-   export PYTHONPATH=/path/to/Paraell-Codebook:$PYTHONPATH
-   cd /path/to/Paraell-Codebook
-   python main.py --mode generate ...
-   ```
-2. **Run from project root:**
-   ```bash
-   cd /path/to/Paraell-Codebook
-   python main.py --mode generate ...
-   ```
-3. **Install as package:** (Advanced)
-   ```bash
-   pip install -e .
-   ```
-
-### 9. Version Compatibility Issues
-
-**Check Python and Package Versions:**
-```bash
+# Check environment
 python --version
-pip list | grep -E "(torch|transformers|sentence-transformers|faiss)"
-```
+python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+python -c "from genrec.pipeline import Pipeline; print('Import OK')"
 
-**Required Versions:**
-- Python 3.8+
-- PyTorch 1.12+
-- Transformers 4.36+
+# Verify data
+ls -la /data/cache/Netease/raw/ 2>/dev/null || echo "Data not found"
 
-### 10. Quick Diagnostics
-
-Run these commands to check your setup:
-
-```bash
-# 1. Check Python
-python --version
-
-# 2. Test basic import
-python -c "import torch; print(f'PyTorch {torch.__version__}')"
-
-# 3. Test project import
-python -c "from genrec.pipeline import Pipeline; print('Pipeline import OK')"
-
-# 4. Check data files
-ls -la /data/cache/Netease/raw/ 2>/dev/null || echo "Data directory not found"
-
-# 5. Check model files
+# Find checkpoints
 find . -name "*.pth" -o -name "*.pt" 2>/dev/null | head -5
-
-# 6. Check dependencies
-pip install -r requirements.txt
 ```
 
-### 11. Getting Help
+## Need More Help?
 
-If issues persist:
-
-1. **Check logs:** Look for detailed error messages in console output
-2. **Verify file paths:** Ensure all paths in config files are correct
-3. **Check permissions:** Ensure read/write permissions for data directories
-4. **Update code:** Pull latest changes if using git repository
-
-**Common Configuration Files to Check:**
-- `genrec/default.yaml` - Global settings
-- `genrec/models/RPG/config.yaml` - Model-specific settings
-- `genrec/datasets/Netease/config.yaml` - Dataset settings
+1. Check console logs for detailed error messages and stack traces
+2. Verify paths in `genrec/default.yaml` and `genrec/models/RPG/config.yaml`
+3. Ensure read/write permissions for data and output directories
+4. Pull the latest code: `git pull origin main`

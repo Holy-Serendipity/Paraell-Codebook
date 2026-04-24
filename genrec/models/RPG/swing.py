@@ -81,14 +81,11 @@ class SwingSimilarity:
         计算用户间的共同点击物品数量 |I_u ∩ I_v|。
         返回稀疏矩阵以节省内存。
         """
-        self.logger.info("[SWING] Computing user-user co-occurrence matrix（sparse)")
+        self.logger.info("[SWING] Computing user-user co-occurrence matrix (sparse)")
 
         # 计算用户-用户共同点击物品数量
         # (U x I) @ (I x U) = (U x U) 中的每个元素表示共同点击物品数
         user_cooccurrence = user_item_matrix @ user_item_matrix.T
-
-        # 转换为稠密矩阵（对于大规模数据可能内存过大，后续需要优化）
-        user_cooccurrence = user_cooccurrence.toarray()
 
         self.logger.info(f"[SWING] User co-occurrence matrix shape: {user_cooccurrence.shape}, nnz: {user_cooccurrence.nnz}")
         return user_cooccurrence

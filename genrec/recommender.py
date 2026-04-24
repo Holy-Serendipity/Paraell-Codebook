@@ -266,7 +266,6 @@ class Recommender:
             # Set wandb run name if not provided
             wandb_run_name = config.get('wandb_run_name')
             if wandb_run_name is None:
-                from datetime import datetime
                 wandb_run_name = f"generate-{config.get('model', 'unknown')}-{config.get('dataset', 'unknown')}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
                 config['wandb_run_name'] = wandb_run_name
 
@@ -274,28 +273,21 @@ class Recommender:
             wandb.init(
                 project=config.get('wandb_project', 'RPG-Netease'),
                 name=wandb_run_name,
-                config=config,  # Record all configuration parameters
-                dir=project_dir,  # Set wandb directory
-                resume="allow",  # Allow resume
-                mode=config.get('wandb_mode', 'online'),  # Online or offline mode
-                entity=config.get('wandb_entity'),  # Team or user name
-                tags=config.get('wandb_tags', []) + ['generation']  # Add generation tag
+                config=config,
+                dir=project_dir,
+                resume="allow",
+                mode=config.get('wandb_mode', 'online'),
+                entity=config.get('wandb_entity'),
+                tags=config.get('wandb_tags', []) + ['generation']
             )
 
-            # Save wandb run info to config
             config['wandb_run'] = wandb.run
             config['wandb_run_id'] = wandb.run.id
 
-            # Record configuration to wandb
-            wandb.config.update(config)
-
-            # Create wandb config file
             config_file_path = os.path.join(project_dir, 'config_generate.yaml')
             with open(config_file_path, 'w') as f:
                 import yaml
                 yaml.dump(config, f)
-
-            # Upload config file to wandb
             wandb.save(config_file_path, base_path=os.path.dirname(config_file_path))
 
             logger.info(f"Initialized wandb run: {wandb_run_name} (ID: {wandb.run.id})")
@@ -735,30 +727,18 @@ class Recommender:
         # Log generation summary to wandb
         if self.config.get('wandb_run') is not None:
             try:
-                # Calculate recommendation quality metrics
                 quality_metrics = self._calculate_recommendation_quality(recommendations)
-
-                # Record quality metrics
-                wandb.log(quality_metrics)
-
-                # Record summary metrics
                 summary_metrics = {
                     'generation/total_users': len(recommendations),
                     'generation/total_recommendations': len(recommendations) * default_metadata.get('top_k', 10),
                     'generation/output_path': output_path,
-                    'generation/checkpoint': default_metadata.get('checkpoint', 'unknown'),
                 }
-                wandb.log(summary_metrics)
+                quality_metrics.update(summary_metrics)
+                wandb.log(quality_metrics)
 
-                # Update wandb run summary
                 for key, value in quality_metrics.items():
                     wandb.run.summary[key] = value
-                wandb.run.summary['generation/total_users'] = len(recommendations)
-                wandb.run.summary['generation/output_path'] = output_path
-                wandb.run.summary['generation/completed_at'] = default_metadata.get('generation_time',
-                                                                                    datetime.now().isoformat())
 
-                # Save recommendations file as wandb artifact
                 artifact = wandb.Artifact(
                     name=f"recommendations-{os.path.basename(output_path).replace('.json', '')}",
                     type="recommendations",

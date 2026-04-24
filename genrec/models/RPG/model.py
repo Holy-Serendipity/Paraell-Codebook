@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
+import time
+from tqdm import tqdm
 from transformers import GPT2Config, GPT2Model
 
 from genrec.dataset import AbstractDataset
@@ -467,6 +469,485 @@ class SwingEnhancement(nn.Module):
         enhanced_embs = flat_enhanced.view(batch_size, seq_len, emb_dim)
         return enhanced_embs
 
+class SwingEnhancement(nn.Module):
+    """Swing算法增强语义embedding"""
+    def __init__(self, config, dataset, tokenizer, embedding_layer=None):
+        super().__init__()
+        self.config = config
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.embedding_layer = embedding_layer  # GPT-2的wte层，用于计算物品embedding
+
+        # 增强配置
+        self.swing_enhance_weight = config.get('swing_enhance_weight', 0.3)
+        self.swing_neighbors = config.get('swing_neighbors', 10)
+        self.enhance_type = config.get('swing_enhance_type', 'additive')
+
+        # 可学习的增强门控（如果使用gated类型）
+        if self.enhance_type == 'gated':
+            self.enhance_gate = nn.Linear(config['n_embd'] * 2, config['n_embd'])
+
+        # 图卷积参数（如果使用graph类型）
+        if self.enhance_type == 'graph':
+            self.W_self = nn.Linear(config['n_embd'], config['n_embd'])
+            self.W_neighbor = nn.Linear(config['n_embd'], config['n_embd'])
+            # 初始化：W_self接近恒等映射，W_neighbor接近零
+            nn.init.eye_(self.W_self.weight)
+            nn.init.zeros_(self.W_self.bias)
+            nn.init.zeros_(self.W_neighbor.weight)
+            nn.init.zeros_(self.W_neighbor.bias)
+            self.enhance_activation = config.get('swing_enhance_activation', False)
+            if self.enhance_activation:
+                self.enhance_act_fn = nn.GELU()
+
+        # Swing相似度计算器
+        self.swing_sim = None
+        self.sim_matrix = None  # 缓存相似度矩阵
+        self.all_item_embeddings = None  # 缓存所有物品的语义embedding
+        self.topk_neighbors_cache = None  # 缓存每个物品的top-k邻居（索引和权重）
+        self.topk_precomputed = False  # 是否已预计算top-k邻居
+        self.weighted_neighbor_embs = None  # 缓存每个物品的加权邻居embedding（CPU张量）
+
+    def init_swing_sim(self):
+        """延迟初始化Swing相似度计算器"""
+        if self.swing_sim is None:
+            from .swing import SwingSimilarity
+            self.swing_sim = SwingSimilarity(
+                dataset=self.dataset,
+                alpha=self.config.get('swing_alpha', 1.0),
+                min_cooccurrence=self.config.get('swing_min_cooccurrence', 2),
+                device='cpu'  # 相似度矩阵在CPU上计算，避免GPU内存和兼容性问题
+            )
+
+    def precompute_topk_neighbors(self):
+        """预计算每个物品的top-k邻居（索引和权重）并缓存，避免前向传播中重复计算（GPU加速版）"""
+        if self.topk_precomputed and self.topk_neighbors_cache is not None:
+            return
+
+        sim_matrix = self.get_similarity_matrix(sparse=True)
+        n_items = self.dataset.n_items
+        k = self.swing_neighbors
+        print(f"[SwingEnhancement] Precomputing top-{k} neighbors for {n_items} items...")
+
+        # 强制使用CPU预计算，避免DataLoader multiprocessing导致的CUDA状态冲突
+        use_gpu = False
+        device = 'cpu'
+        print(f"[SwingEnhancement] Using CPU for precomputation")
+
+        # 输出张量（保持在CPU）
+        topk_indices = torch.zeros(n_items, k, dtype=torch.long, device='cpu')
+        topk_weights = torch.zeros(n_items, k, dtype=torch.float32, device='cpu')
+
+        if sim_matrix.is_sparse:
+            sim_matrix = sim_matrix.coalesce()
+            indices = sim_matrix.indices()
+            values = sim_matrix.values()
+
+            # 打印稀疏矩阵信息
+            print(f"[SwingEnhancement] Sparse matrix shape: {sim_matrix.shape}, nnz: {sim_matrix._nnz()}")
+            print(f"[SwingEnhancement] Non-zero density: {sim_matrix._nnz()/(n_items*n_items):.6f}")
+
+            # 在CPU上计算行计数和行起始位置（torch.bincount不支持GPU）
+            row_counts = torch.bincount(indices[0], minlength=n_items)
+            row_starts = torch.cumsum(row_counts, dim=0) - row_counts
+
+            # 打印行计数统计
+            print(f"[SwingEnhancement] Row counts - min: {row_counts.min().item()}, max: {row_counts.max().item()}, mean: {row_counts.float().mean().item():.2f}")
+
+            # 移动稀疏矩阵到目标设备（如果需要GPU加速）
+            if use_gpu:
+                indices_dev = indices.to(device)
+                values_dev = values.to(device)
+            else:
+                indices_dev = indices
+                values_dev = values
+
+            # 分批处理，利用GPU向量化topk
+            batch_size = 8192 if use_gpu else 1
+            for batch_start in tqdm(range(0, n_items, batch_size), desc="Precomputing top-k neighbors", unit="batch"):
+                batch_end = min(batch_start + batch_size, n_items)
+
+                batch_n = batch_end - batch_start
+                batch_counts = row_counts[batch_start:batch_end]
+                max_count = batch_counts.max().item()
+
+                if max_count == 0:
+                    continue
+
+                # 构建填充张量 [batch_n, max_count]
+                padded_vals = torch.zeros(batch_n, max_count, device=device)
+                padded_cols = torch.zeros(batch_n, max_count, dtype=torch.long, device=device)
+
+                for offset in range(batch_n):
+                    item_id = batch_start + offset
+                    count = row_counts[item_id].item()
+                    if count == 0:
+                        continue
+                    start = row_starts[item_id].item()
+                    padded_vals[offset, :count] = values_dev[start:start+count]
+                    padded_cols[offset, :count] = indices_dev[1][start:start+count]
+
+                # 向量化top-k
+                k_actual = min(k, max_count)
+                topk_vals, topk_pos = torch.topk(padded_vals, k=k_actual, dim=1)
+                topk_cols = torch.gather(padded_cols, 1, topk_pos)
+
+                # 排除自身并归一化
+                self_ids = torch.arange(batch_start, batch_end, device=device).unsqueeze(1)
+                non_self_mask = topk_cols != self_ids
+
+                for offset in range(batch_n):
+                    mask = non_self_mask[offset]
+                    valid_cols = topk_cols[offset][mask][:k]
+                    valid_vals = topk_vals[offset][mask][:k]
+                    n_valid = len(valid_cols)
+                    if n_valid > 0:
+                        weight_sum = valid_vals.sum()
+                        if weight_sum > 0:
+                            valid_vals = valid_vals / weight_sum
+                        topk_indices[batch_start + offset, :n_valid] = valid_cols.cpu()
+                        topk_weights[batch_start + offset, :n_valid] = valid_vals.cpu()
+
+            del indices_dev, values_dev
+        else:
+            # 稠密矩阵情况
+            sim_matrix_dense = sim_matrix.to(device)
+            for item_id in tqdm(range(n_items), desc="Precomputing top-k neighbors (dense)", unit="item"):
+                row = sim_matrix_dense[item_id]
+                row[item_id] = -1
+                topk_vals, topk_idx = torch.topk(row, k=k)
+                if topk_vals[0] > 0:
+                    weight_sum = topk_vals.sum()
+                    if weight_sum > 0:
+                        topk_vals = topk_vals / weight_sum
+                    topk_indices[item_id] = topk_idx.cpu()
+                    topk_weights[item_id] = topk_vals.cpu()
+
+        # 存储为张量格式
+        self.topk_neighbors_cache = (topk_indices, topk_weights)
+        self.topk_precomputed = True
+        print(f"[SwingEnhancement] Top-{k} neighbors precomputation completed")
+
+        # 计算加权邻居embedding（GPU加速）
+        print(f"[SwingEnhancement] Computing weighted neighbor embeddings...")
+        compute_device = 'cpu'
+
+        all_item_embs = self.get_all_item_embeddings()
+        topk_indices_gpu = topk_indices.to(compute_device)
+        topk_weights_gpu = topk_weights.to(compute_device)
+        all_item_embs_gpu = all_item_embs.to(compute_device)
+
+        neighbor_embs = all_item_embs_gpu[topk_indices_gpu]
+        weighted_neighbor_embs = torch.sum(topk_weights_gpu.unsqueeze(-1) * neighbor_embs, dim=1)
+
+        del topk_indices_gpu, topk_weights_gpu, neighbor_embs, all_item_embs_gpu
+        if compute_device == 'cuda':
+            torch.cuda.empty_cache()
+
+        self.weighted_neighbor_embs = weighted_neighbor_embs.cpu()
+        print(f"[SwingEnhancement] Weighted neighbor embeddings computed on {compute_device} and moved back to CPU")
+
+    def get_similarity_matrix(self, sparse=True):
+        """获取相似度矩阵，如果未计算则自动计算
+
+        Args:
+            sparse: 是否返回稀疏矩阵，默认为True以节省内存
+
+        Returns:
+            相似度矩阵（稠密或稀疏格式）
+        """
+        if self.sim_matrix is None:
+            self.init_swing_sim()
+            try:
+                # 计算相似度矩阵（会自动调用compute_similarity_matrix）
+                if sparse:
+                    # 使用稀疏相似度矩阵
+                    self.sim_matrix = self.swing_sim.get_sparse_similarity_matrix()
+                else:
+                    # 使用稠密相似度矩阵（可能内存过大）
+                    self.sim_matrix = self.swing_sim.get_similarity_matrix(normalized=True)
+                print(f"[SwingEnhancement] Similarity matrix computed: {self.sim_matrix.shape}")
+            except Exception as e:
+                print(f"[WARNING] Failed to compute swing similarity matrix: {e}")
+                # 返回一个稀疏单位矩阵作为后备（始终在CPU上）
+                n_items = self.dataset.n_items
+                device = 'cpu'  # 始终在CPU上，避免GPU内存问题
+                if sparse:
+                    # 创建稀疏单位矩阵
+                    indices = torch.arange(n_items, device=device).repeat(2, 1)
+                    values = torch.ones(n_items, device=device)
+                    self.sim_matrix = torch.sparse_coo_tensor(indices, values, (n_items, n_items))
+                else:
+                    self.sim_matrix = torch.eye(n_items, device=device)
+                print(f"[SwingEnhancement] Using {'sparse ' if sparse else ''}identity matrix as fallback: {self.sim_matrix.shape}")
+
+        # 确保相似度矩阵在CPU上（避免GPU内存问题）
+        if self.sim_matrix is not None and self.sim_matrix.device.type != 'cpu':
+            self.sim_matrix = self.sim_matrix.cpu()
+
+        return self.sim_matrix
+
+    def set_similarity_matrix(self, sim_matrix):
+        """设置相似度矩阵（用于测试）"""
+        self.sim_matrix = sim_matrix
+
+    def get_similarity_row(self, sim_matrix, item_id):
+        """获取相似度矩阵的指定行（支持稀疏和稠密矩阵）"""
+        if sim_matrix.is_sparse:
+            # 稀疏矩阵：提取指定行的非零元素
+            sim_matrix = sim_matrix.coalesce()
+            indices = sim_matrix.indices()
+            values = sim_matrix.values()
+
+            # 找到该行的非零元素
+            row_mask = indices[0] == item_id
+            if not row_mask.any():
+                # 该行没有非零元素（除了对角线可能为0）
+                return torch.zeros(sim_matrix.size(1), device=sim_matrix.device)
+
+            row_indices = indices[1][row_mask]
+            row_values = values[row_mask]
+
+            # 创建稠密行
+            dense_row = torch.zeros(sim_matrix.size(1), device=sim_matrix.device)
+            dense_row[row_indices] = row_values
+
+            # 确保对角线元素（自身相似度）存在
+            # 对于单位矩阵后备，对角线为1；对于Swing矩阵，对角线可能为0或未存储
+            # 我们添加一个小的自相似度以确保自身可被排除
+            current_val = dense_row[item_id]
+            dense_row[item_id] = torch.max(current_val, torch.tensor(1e-6, device=dense_row.device))
+
+            return dense_row
+        else:
+            # 稠密矩阵：直接返回行
+            return sim_matrix[item_id]
+
+    def get_batch_similarity_submatrix(self, sim_matrix, batch_items):
+        """从相似度矩阵提取batch内物品的子矩阵（优化版本）
+
+        避免为每个batch item创建稠密行（350k元素），直接从稀疏COO格式中
+        查找batch内物品对的相似度。
+
+        Args:
+            sim_matrix: 相似度矩阵（稀疏或稠密）
+            batch_items: batch中的物品ID列表/张量 [bs]
+
+        Returns:
+            submatrix: batch内物品的相似度子矩阵 [bs, bs]
+        """
+        if isinstance(batch_items, torch.Tensor):
+            original_device = batch_items.device
+            batch_items_cpu = batch_items.cpu()
+        else:
+            original_device = sim_matrix.device
+            batch_items_cpu = torch.tensor(batch_items, device='cpu')
+
+        bs = len(batch_items_cpu)
+
+        if sim_matrix.is_sparse:
+            sim_matrix = sim_matrix.coalesce()
+            indices = sim_matrix.indices()  # [2, nnz] (sorted by row after coalesce)
+            values = sim_matrix.values()    # [nnz]
+
+            # 构建batch物品到idx的映射，用于O(1)查找
+            batch_items_list = batch_items_cpu.tolist()
+            batch_item_to_idx = {item_id: idx for idx, item_id in enumerate(batch_items_list)}
+
+            # 使用bincount预计算每行的范围（O(nnz)一次，后续O(1)查询）
+            n_total = sim_matrix.size(0)
+            row_counts = torch.bincount(indices[0], minlength=n_total)
+            row_starts = torch.cumsum(row_counts, dim=0) - row_counts
+
+            submatrix = torch.zeros((bs, bs), device='cpu')
+
+            # 对每个batch内的物品，直接从稀疏矩阵的行范围中查找非零邻居
+            # 避免创建350k稠密行
+            for i, item_i in enumerate(batch_items_list):
+                start = row_starts[item_i].item()
+                end = start + row_counts[item_i].item()
+
+                if start == end:
+                    continue
+
+                row_cols = indices[1][start:end]
+                row_vals = values[start:end]
+
+                # 只提取列也在batch中的相似度值
+                for col, val in zip(row_cols.tolist(), row_vals.tolist()):
+                    j = batch_item_to_idx.get(col)
+                    if j is not None:
+                        submatrix[i, j] = val
+        else:
+            # 稠密矩阵：直接索引（快速路径）
+            submatrix = sim_matrix[batch_items_cpu][:, batch_items_cpu]
+
+        if original_device != submatrix.device:
+            submatrix = submatrix.to(original_device)
+
+        return submatrix
+
+    def set_embedding_layer(self, embedding_layer):
+        """设置embedding层（GPT-2的wte层）"""
+        self.embedding_layer = embedding_layer
+        # 当embedding层设置后，清空缓存，以便重新计算
+        self.all_item_embeddings = None
+
+    def compute_all_item_embeddings(self):
+        """计算所有物品的语义embedding并缓存（优化版本：结果存储在CPU上以节省GPU内存）"""
+        if self.embedding_layer is None:
+            raise RuntimeError("Embedding layer not set. Call set_embedding_layer() first.")
+
+        n_items = self.dataset.n_items
+        emb_dim = self.config['n_embd']
+        compute_device = self.embedding_layer.weight.device  # 计算设备（可能是GPU）
+        store_device = 'cpu'  # 存储设备（始终为CPU）
+
+        # 根据计算设备调整批量大小
+        if compute_device.type == 'cuda':
+            batch_size = 100  # GPU上使用较小的批量
+        else:
+            batch_size = 500  # CPU上可以使用较大的批量
+
+        # 结果存储在CPU上
+        all_embs = torch.zeros((n_items, emb_dim), device=store_device)
+
+        # 收集所有物品的token和对应的物品ID
+        item_ids_list = []
+        tokens_list = []
+
+        # 首先收集所有数据
+        for item_str, tokens in self.tokenizer.item2tokens.items():
+            item_id = self.dataset.item2id.get(item_str)
+            if item_id is None:
+                continue
+            item_ids_list.append(item_id)
+            tokens_list.append(tokens)
+
+        # 转换为张量并分批处理
+        total_items = len(item_ids_list)
+        print(f"[SwingEnhancement] Computing embeddings for {total_items} items in batches of {batch_size} (compute_device: {compute_device}, store_device: {store_device})")
+
+        # 使用no_grad避免梯度计算和内存占用
+        with torch.no_grad():
+            for start_idx in tqdm(range(0, total_items, batch_size), desc="Computing embeddings", unit="batch"):
+                end_idx = min(start_idx + batch_size, total_items)
+                batch_item_ids = item_ids_list[start_idx:end_idx]
+                batch_tokens = tokens_list[start_idx:end_idx]
+
+                # 创建批量token张量并移到计算设备
+                batch_token_tensor = torch.tensor(batch_tokens, dtype=torch.long, device=compute_device)
+
+                # 通过embedding层获取embedding，然后取平均
+                # embedding_layer期望形状 [batch_size, n_digit]，返回 [batch_size, n_digit, emb_dim]
+                batch_embs = self.embedding_layer(batch_token_tensor).mean(dim=-2)  # [batch_size, emb_dim] (在计算设备上)
+
+                # 将embedding移回CPU并存储
+                batch_embs_cpu = batch_embs.to(store_device)
+                for i, item_id in enumerate(batch_item_ids):
+                    all_embs[item_id] = batch_embs_cpu[i]
+
+                # 清理中间张量以释放内存
+                del batch_token_tensor, batch_embs, batch_embs_cpu
+                if compute_device.type == 'cuda':
+                    torch.cuda.empty_cache()
+
+        print(f"[SwingEnhancement] Completed computing embeddings for {total_items} items")
+        self.all_item_embeddings = all_embs
+        return all_embs
+
+    def get_all_item_embeddings(self):
+        """获取所有物品的语义embedding，如果未缓存则计算"""
+        if self.all_item_embeddings is None:
+            self.compute_all_item_embeddings()
+        return self.all_item_embeddings
+
+    def set_all_item_embeddings(self, embeddings):
+        """设置所有物品的语义embedding（用于测试）"""
+        self.all_item_embeddings = embeddings
+
+    def forward(self, semantic_embs, item_ids):
+        """增强语义embedding（向量化优化版本：使用预计算的加权邻居embedding）"""
+        if not self.config.get('use_swing_enhancement', False):
+            return semantic_embs
+
+        # 获取目标设备（输入embedding所在的设备）
+        target_device = semantic_embs.device
+
+        # 预计算top-k邻居（如果尚未计算）
+        try:
+            self.precompute_topk_neighbors()
+        except Exception as e:
+            print(f"[WARNING] Failed to precompute top-k neighbors, skipping enhancement: {e}")
+            return semantic_embs
+
+        # 确保加权邻居embedding矩阵存在
+        if self.weighted_neighbor_embs is None:
+            # 如果weighted_neighbor_embs未计算，跳过增强（可能是预计算失败）
+            print(f"[WARNING] weighted_neighbor_embs not computed, skipping enhancement")
+            return semantic_embs
+
+        # 确保增强权重参数在正确设备上（如果使用门控增强）
+        if self.enhance_type == 'gated' and self.enhance_gate.weight.device != target_device:
+            self.enhance_gate = self.enhance_gate.to(target_device)
+
+        if self.enhance_type == 'graph':
+            if self.W_self.weight.device != target_device:
+                self.W_self = self.W_self.to(target_device)
+                self.W_neighbor = self.W_neighbor.to(target_device)
+
+        batch_size, seq_len, emb_dim = semantic_embs.shape
+
+        # 将物品ID展平，以便批处理
+        flat_item_ids = item_ids.view(-1)  # [batch_size * seq_len]
+        flat_semantic_embs = semantic_embs.view(-1, emb_dim)  # [batch_size * seq_len, emb_dim]
+        flat_enhanced = torch.zeros_like(flat_semantic_embs)
+
+        # 创建掩码：非padding物品（item_id != 0）
+        non_padding_mask = flat_item_ids != 0
+        non_padding_indices = torch.where(non_padding_mask)[0]
+        non_padding_item_ids = flat_item_ids[non_padding_mask]  # [num_non_padding]
+
+        if len(non_padding_item_ids) > 0:
+            # 从加权邻居embedding矩阵中获取对应的embedding（CPU）
+            weighted_neighbor_cpu = self.weighted_neighbor_embs[non_padding_item_ids.cpu()]  # [num_non_padding, emb_dim] (CPU)
+            # 转移到目标设备
+            weighted_neighbor_target = weighted_neighbor_cpu.to(target_device)  # [num_non_padding, emb_dim] (target_device)
+            # 获取对应的输入embedding
+            input_embs = flat_semantic_embs[non_padding_mask]  # [num_non_padding, emb_dim] (target_device)
+
+            # 根据增强类型计算增强embedding（向量化）
+            if self.enhance_type == 'additive':
+                enhanced = input_embs + self.swing_enhance_weight * weighted_neighbor_target
+            elif self.enhance_type == 'multiplicative':
+                # 注意：确保数值稳定，避免过大乘积
+                enhanced = input_embs * (1 + self.swing_enhance_weight * weighted_neighbor_target)
+            elif self.enhance_type == 'gated':
+                # 门控融合（向量化）
+                combined = torch.cat([input_embs, weighted_neighbor_target], dim=-1)  # [num_non_padding, 2*emb_dim]
+                gate = torch.sigmoid(self.enhance_gate(combined))  # [num_non_padding, emb_dim]
+                enhanced = gate * input_embs + (1 - gate) * weighted_neighbor_target
+            elif self.enhance_type == 'graph':
+                # 图卷积增强：W_self * input_embs + W_neighbor * neighbor_embs
+                enhanced = self.W_self(input_embs) + self.W_neighbor(weighted_neighbor_target)
+                if getattr(self, 'enhance_activation', False) and hasattr(self, 'enhance_act_fn'):
+                    enhanced = self.enhance_act_fn(enhanced)
+            else:
+                enhanced = input_embs
+
+            # 将结果赋值回flat_enhanced
+            flat_enhanced[non_padding_indices] = enhanced
+
+        # padding位置保持原始embedding
+        padding_indices = torch.where(~non_padding_mask)[0]
+        if len(padding_indices) > 0:
+            flat_enhanced[padding_indices] = flat_semantic_embs[padding_indices]
+
+        # 恢复原始形状
+        enhanced_embs = flat_enhanced.view(batch_size, seq_len, emb_dim)
+        return enhanced_embs
+
+
 class RPG(AbstractModel):
     def __init__(
         self,
@@ -477,6 +958,7 @@ class RPG(AbstractModel):
         super(RPG, self).__init__(config, dataset, tokenizer)
 
         self.item_id2tokens = self._map_item_tokens().to(self.config['device'])
+        # 移除item-id embedding相关代码（使用Swing增强替代）
         # self.item_id_embedding=nn.Embedding(
         #     num_embeddings=self.dataset.n_items+1,
         #     embedding_dim=config['n_embd'],
@@ -540,6 +1022,7 @@ class RPG(AbstractModel):
             except Exception as e:
                 print(f"[WARNING] Failed to precompute swing data: {e}")
                 print(f"[WARNING] Swing enhancement will be disabled or use fallback")
+
         self.n_pred_head = self.tokenizer.n_digit
         pred_head_list = []
         for i in range(self.n_pred_head):
@@ -884,7 +1367,7 @@ class RPG(AbstractModel):
                         temp = temp.index_select(1, col_inds)
                         sum_block += temp
 
-                    avg_block = sum_block / n_digit.to(torch.float32)
+                    avg_block = sum_block / float(n_digit)
                     j_offsets = torch.arange(bj, device=device)
                     global_j = j_start + j_offsets
 
