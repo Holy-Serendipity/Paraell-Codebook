@@ -89,6 +89,26 @@ model.swing_enhancement.precompute_topk_neighbors()
 - Start with small weight (`swing_enhance_weight: 0.1`)
 - Verify similarity matrix contains meaningful values
 - Check logs for `[SwingEnhancement]` messages confirming enhancement is active
+- Try different `swing_enhance_type` — each has different behavior:
+  - `gated` — learnable feature-level soft selection; default
+  - `graph` — more expressive but needs more data
+  - `attention` — highest capacity but most memory
+
+### Swing Attention: Dimension Mismatch
+```
+AssertionError: n_embd(448) must be divisible by n_head(X)
+```
+**Cause**: `n_embd` must be divisible by `swing_attention_n_head`. Default `n_embd=448` works with heads 1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112, 224.
+
+**Fix**: Set `swing_attention_n_head` to a divisor of `n_embd` (default: 4).
+
+### Swing Attention: High Memory Usage
+The attention type caches `topk_neighbor_embs` as `[n_items, k, emb_dim]` — for a 350k-item catalog with `k=10`, `emb_dim=448`, this is ~5.9 GB (FP32) or ~3.0 GB (FP16). All data stays on CPU; only per-batch slices are moved to GPU during forward pass.
+
+**Fixes**:
+- Reduce `swing_neighbors` (k) to lower memory
+- Ensure sufficient system RAM for the CPU cache
+- Monitor with `torch.cuda.memory_summary()` for GPU OOM
 
 ## Generation Issues
 

@@ -69,9 +69,11 @@ swing_distill_weight: 0.1             # 蒸馏损失权重
 use_swing_enhancement: false          # 是否使用Swing增强语义ID
 swing_enhance_weight: 0.3             # Swing增强权重（0-1）
 swing_neighbors: 10                   # 用于增强的邻居数量
-swing_enhance_type: additive          # 增强类型：additive/multiplicative/gated/graph
+swing_enhance_type: gated     # 增强类型：gated/graph/attention
 swing_enhance_activation: false       # graph增强是否使用激活函数（GELU）
 swing_enhance_cache: true             # 是否缓存增强结果
+swing_attention_n_head: 4             # Swing Attention多头注意力的头数（仅attention类型）
+swing_attention_dropout: 0.1          # Swing Attention的dropout率（仅attention类型）
 
 # 兼容性配置
 use_item_id_embedding: false          # 是否使用item-id embedding（默认禁用）

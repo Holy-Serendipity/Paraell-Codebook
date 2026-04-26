@@ -50,6 +50,79 @@ class ResBlock(nn.Module):
         x = self.dropout(x)
         return x + residual
 
+class SwingAttention(nn.Module):
+    """Swing Attention: 使用Swing相似度作为图结构偏置的多头图注意力层
+
+    与additive/gated/graph方式的区别：
+    - 不将邻居信息预聚合为单个向量，而是保留邻居序列
+    - 通过可学习的注意力机制，让模型根据内容选择性地关注不同邻居
+    - Swing相似度作为注意力偏置（bias），影响注意力分布
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.n_embd = config['n_embd']
+        self.n_head = config.get('swing_attention_n_head', 4)
+        self.head_dim = self.n_embd // self.n_head
+        assert self.head_dim * self.n_head == self.n_embd, \
+            f"n_embd({self.n_embd}) must be divisible by n_head({self.n_head})"
+
+        # QKV变换
+        self.W_query = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.W_key = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.W_value = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.W_out = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+        # 可学习的Swing偏置缩放
+        self.swing_scale = nn.Parameter(torch.tensor(1.0))
+
+        # 正则化
+        self.attn_dropout = nn.Dropout(config.get('swing_attention_dropout', 0.1))
+        self.out_dropout = nn.Dropout(config.get('swing_attention_dropout', 0.1))
+        self.norm = nn.LayerNorm(self.n_embd)
+
+        # 初始化
+        nn.init.xavier_uniform_(self.W_query.weight)
+        nn.init.xavier_uniform_(self.W_key.weight)
+        nn.init.xavier_uniform_(self.W_value.weight)
+        nn.init.xavier_uniform_(self.W_out.weight)
+
+    def forward(self, target_emb, neighbor_embs, swing_scores):
+        """
+        Args:
+            target_emb: [batch, n_embd] 目标物品embedding
+            neighbor_embs: [batch, n_neighbors, n_embd] 邻居物品embedding
+            swing_scores: [batch, n_neighbors] Swing相似度分数（作为attention bias）
+
+        Returns:
+            [batch, n_embd] 增强后的embedding（含残差连接和LayerNorm）
+        """
+        batch, n_neighbors, _ = neighbor_embs.shape
+
+        # 多头QKV
+        Q = self.W_query(target_emb).view(batch, self.n_head, self.head_dim)         # [batch, n_head, d]
+        K = self.W_key(neighbor_embs).view(batch, n_neighbors, self.n_head, self.head_dim)  # [batch, n_nei, n_head, d]
+        V = self.W_value(neighbor_embs).view(batch, n_neighbors, self.n_head, self.head_dim)  # [batch, n_nei, n_head, d]
+
+        # 注意力分数: [batch, n_head, n_neighbors]
+        attn_scores = torch.einsum('bhd,bnhd->bhn', Q, K) / (self.head_dim ** 0.5)
+
+        # 加入Swing偏置: [batch, n_neighbors] -> [batch, 1, n_neighbors]
+        swing_bias = self.swing_scale * swing_scores.unsqueeze(1)
+        attn_scores = attn_scores + swing_bias
+
+        # Softmax -> 注意力权重
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [batch, n_head, n_neighbors]
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # 加权聚合: [batch, n_head, d]
+        attn_output = torch.einsum('bhn,bnhd->bhd', attn_weights, V)
+        attn_output = attn_output.contiguous().view(batch, self.n_embd)
+
+        # 输出投影 + 残差连接 + LayerNorm
+        output = self.norm(target_emb + self.out_dropout(self.W_out(attn_output)))
+        return output
+
+
 class SwingEnhancement(nn.Module):
     """Swing算法增强语义embedding"""
     def __init__(self, config, dataset, tokenizer, embedding_layer=None):
@@ -81,6 +154,10 @@ class SwingEnhancement(nn.Module):
             if self.enhance_activation:
                 self.enhance_act_fn = nn.GELU()
 
+        # Swing Attention（如果使用attention类型）
+        if self.enhance_type == 'attention':
+            self.swing_attention = SwingAttention(config)
+
         # Swing相似度计算器
         self.swing_sim = None
         self.sim_matrix = None  # 缓存相似度矩阵
@@ -88,6 +165,7 @@ class SwingEnhancement(nn.Module):
         self.topk_neighbors_cache = None  # 缓存每个物品的top-k邻居（索引和权重）
         self.topk_precomputed = False  # 是否已预计算top-k邻居
         self.weighted_neighbor_embs = None  # 缓存每个物品的加权邻居embedding（CPU张量）
+        self.topk_neighbor_embs = None  # 缓存每个物品的top-k邻居embedding [n_items, k, emb_dim]（用于attention类型）
 
     def init_swing_sim(self):
         """延迟初始化Swing相似度计算器"""
@@ -219,6 +297,10 @@ class SwingEnhancement(nn.Module):
         all_item_embs_gpu = all_item_embs.to(compute_device)
 
         neighbor_embs = all_item_embs_gpu[topk_indices_gpu]
+
+        # 缓存未聚合的邻居embedding（用于attention类型）
+        self.topk_neighbor_embs = neighbor_embs.cpu()
+
         weighted_neighbor_embs = torch.sum(topk_weights_gpu.unsqueeze(-1) * neighbor_embs, dim=1)
 
         del topk_indices_gpu, topk_weights_gpu, neighbor_embs, all_item_embs_gpu
@@ -462,13 +544,17 @@ class SwingEnhancement(nn.Module):
             print(f"[WARNING] Failed to precompute top-k neighbors, skipping enhancement: {e}")
             return semantic_embs
 
-        # 确保加权邻居embedding矩阵存在
-        if self.weighted_neighbor_embs is None:
+        # 确保缓存存在（attention类型需要topk_neighbor_embs，其他需要weighted_neighbor_embs）
+        if self.enhance_type == 'attention':
+            if self.topk_neighbor_embs is None:
+                print(f"[WARNING] topk_neighbor_embs not computed, skipping enhancement")
+                return semantic_embs
+        elif self.weighted_neighbor_embs is None:
             # 如果weighted_neighbor_embs未计算，跳过增强（可能是预计算失败）
             print(f"[WARNING] weighted_neighbor_embs not computed, skipping enhancement")
             return semantic_embs
 
-        # 确保增强权重参数在正确设备上（如果使用门控增强）
+        # 确保增强权重参数在正确设备上
         if self.enhance_type == 'gated' and self.enhance_gate.weight.device != target_device:
             self.enhance_gate = self.enhance_gate.to(target_device)
 
@@ -476,6 +562,10 @@ class SwingEnhancement(nn.Module):
             if self.W_self.weight.device != target_device:
                 self.W_self = self.W_self.to(target_device)
                 self.W_neighbor = self.W_neighbor.to(target_device)
+
+        if self.enhance_type == 'attention':
+            if self.swing_attention.W_query.weight.device != target_device:
+                self.swing_attention = self.swing_attention.to(target_device)
 
         batch_size, seq_len, emb_dim = semantic_embs.shape
 
@@ -490,31 +580,38 @@ class SwingEnhancement(nn.Module):
         non_padding_item_ids = flat_item_ids[non_padding_mask]  # [num_non_padding]
 
         if len(non_padding_item_ids) > 0:
-            # 从加权邻居embedding矩阵中获取对应的embedding（CPU）
-            weighted_neighbor_cpu = self.weighted_neighbor_embs[non_padding_item_ids.cpu()]  # [num_non_padding, emb_dim] (CPU)
-            # 转移到目标设备
-            weighted_neighbor_target = weighted_neighbor_cpu.to(target_device)  # [num_non_padding, emb_dim] (target_device)
             # 获取对应的输入embedding
             input_embs = flat_semantic_embs[non_padding_mask]  # [num_non_padding, emb_dim] (target_device)
 
-            # 根据增强类型计算增强embedding（向量化）
-            if self.enhance_type == 'additive':
-                enhanced = input_embs + self.swing_enhance_weight * weighted_neighbor_target
-            elif self.enhance_type == 'multiplicative':
-                # 注意：确保数值稳定，避免过大乘积
-                enhanced = input_embs * (1 + self.swing_enhance_weight * weighted_neighbor_target)
-            elif self.enhance_type == 'gated':
-                # 门控融合（向量化）
-                combined = torch.cat([input_embs, weighted_neighbor_target], dim=-1)  # [num_non_padding, 2*emb_dim]
-                gate = torch.sigmoid(self.enhance_gate(combined))  # [num_non_padding, emb_dim]
-                enhanced = gate * input_embs + (1 - gate) * weighted_neighbor_target
-            elif self.enhance_type == 'graph':
-                # 图卷积增强：W_self * input_embs + W_neighbor * neighbor_embs
-                enhanced = self.W_self(input_embs) + self.W_neighbor(weighted_neighbor_target)
-                if getattr(self, 'enhance_activation', False) and hasattr(self, 'enhance_act_fn'):
-                    enhanced = self.enhance_act_fn(enhanced)
+            if self.enhance_type == 'attention':
+                # ===== Swing Attention路径 =====
+                # 从缓存获取Swing分数和邻居embedding
+                swing_scores_cpu = self.topk_neighbors_cache[1][non_padding_item_ids.cpu()]     # [num_non_padding, k]
+                neighbor_embs_cpu = self.topk_neighbor_embs[non_padding_item_ids.cpu()]          # [num_non_padding, k, emb_dim]
+
+                # 转移到目标设备
+                swing_scores = swing_scores_cpu.to(target_device)
+                neighbor_embs = neighbor_embs_cpu.to(target_device)
+
+                # 应用Swing Attention（多头注意力，Swing相似度作为bias）
+                enhanced = self.swing_attention(input_embs, neighbor_embs, swing_scores)
             else:
-                enhanced = input_embs
+                # ===== 传统聚合路径（gated/graph） =====
+                # 从加权邻居embedding矩阵中获取对应的聚合embedding（CPU）
+                weighted_neighbor_cpu = self.weighted_neighbor_embs[non_padding_item_ids.cpu()]  # [num_non_padding, emb_dim] (CPU)
+                weighted_neighbor_target = weighted_neighbor_cpu.to(target_device)  # [num_non_padding, emb_dim] (target_device)
+
+                # 根据增强类型计算增强embedding（向量化）
+                if self.enhance_type == 'gated':
+                    combined = torch.cat([input_embs, weighted_neighbor_target], dim=-1)
+                    gate = torch.sigmoid(self.enhance_gate(combined))
+                    enhanced = gate * input_embs + (1 - gate) * weighted_neighbor_target
+                elif self.enhance_type == 'graph':
+                    enhanced = self.W_self(input_embs) + self.W_neighbor(weighted_neighbor_target)
+                    if getattr(self, 'enhance_activation', False) and hasattr(self, 'enhance_act_fn'):
+                        enhanced = self.enhance_act_fn(enhanced)
+                else:
+                    enhanced = input_embs
 
             # 将结果赋值回flat_enhanced
             flat_enhanced[non_padding_indices] = enhanced

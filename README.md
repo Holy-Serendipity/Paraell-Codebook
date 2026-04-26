@@ -26,7 +26,7 @@ See [Configuration](#configuration) for key settings. For common issues, see [TR
 - **Semantic ID Generation**: Optimized Product Quantization (OPQ) converts item text embeddings into compact discrete codebook representations
 - **GPT-2 Backbone**: Autoregressive transformer predicts next-item semantic IDs from user sequences
 - **Graph-Constrained Decoding**: Item-item similarity graph guides beam search for coherent recommendations
-- **Swing Algorithm Enhancement**: Collaborative filtering information fused with semantic IDs via configurable weighting (additive/multiplicative/gated)
+- **Swing Algorithm Enhancement**: Collaborative filtering fused with semantic IDs via 3 configurable methods (gated/graph/attention)
 - **Flexible Embedding**: Supports BGE, Qwen, OpenAI, and SentenceTransformers models
 - **Sparse Matrix Optimization**: Memory-efficient handling of 350k+ item catalogs
 
@@ -54,9 +54,24 @@ item_id2tokens → GPT-2 wte (mean-pool) → [Swing Enhancement] → GPT-2 → P
 
 ### Swing Enhancement
 Computes item-item similarity from user co-occurrence data (Jaccard or exact Swing) and enhances semantic embeddings via:
-- **additive**: `emb + α · Σ neighbors`
-- **multiplicative**: `emb · (1 + α · neighbors)`
-- **gated**: learnable gate fusion
+- **gated**: `σ(W·[emb;neighbor]) ⊙ emb + (1-σ) ⊙ neighbor` — learnable feature-level soft selection
+- **graph**: `W_self·emb + W_neighbor·neighbor` — dual-transform analogous to GCN layer
+- **attention**: `MultiHeadAttn(Q=emb, K/V=neighbors, bias=Swing_scores)` — retains full neighbor sequence, content-aware multi-head attention with Swing bias (see [Swing Attention](#swing-attention))
+
+All types share the same precomputation pipeline (sparse similarity matrix → top-k neighbors → cached embeddings), differing only in the fusion step.
+
+#### Swing Attention
+Unlike the first four methods (which pre-aggregate neighbor embeddings into a single vector), Swing Attention:
+
+1. **Preserves neighbor sequence** — keeps each neighbor embedding separate as `[k, emb_dim]`
+2. **Computes content-aware attention** — QKV transformations let the model selectively attend to neighbors based on their content
+3. **Adds Swing bias** — Swing similarity scores serve as a fixed bias to the learned attention distribution
+4. **Applies residual + LayerNorm** — stable gradient flow and normalized output
+
+```
+attention_score = Q_target·K_neighbor^T / √d + swing_scale · swing_sim
+enhanced = LayerNorm(emb + W_out(softmax(score)·V))
+```
 
 ## Project Structure
 
@@ -106,9 +121,11 @@ Computes item-item similarity from user co-occurrence data (Jaccard or exact Swi
 | Parameter | Description |
 |-----------|-------------|
 | `use_swing_enhancement` | Enable/disable Swing enhancement |
-| `swing_enhance_weight` | Enhancement strength (0-1) |
+| `swing_enhance_weight` | Enhancement strength (0-1) for gated/graph |
 | `swing_neighbors` | Number of neighbor items to aggregate |
-| `swing_enhance_type` | Fusion: `additive` / `multiplicative` / `gated` |
+| `swing_enhance_type` | Fusion: `gated` / `graph` / `attention` |
+| `swing_attention_n_head` | Attention heads (only for `attention` type; must divide `n_embd`) |
+| `swing_attention_dropout` | Dropout rate for attention weights |
 | `use_item_id_embedding` | Legacy option; disable when using Swing |
 
 ## Usage
@@ -145,6 +162,19 @@ python main.py --mode train --model RPG --dataset Netease \
 
 **Output**: JSON with `metadata` (model, dataset, params) and `recommendations` (per-user ranked list with confidence scores). Scores are log probabilities — negative values are normal, higher (closer to 0) is better.
 
+### Swing Enhancement Examples
+```bash
+# Gated (learnable feature-level selection; default)
+python main.py --use_swing_enhancement=true --swing_enhance_type=gated
+
+# Graph (dual-transform, analogous to GCN)
+python main.py --use_swing_enhancement=true --swing_enhance_type=graph
+
+# Attention (multi-head content-aware, highest capacity)
+python main.py --use_swing_enhancement=true --swing_enhance_type=attention \
+  --swing_attention_n_head=4
+```
+
 ### Embedding Models
 Supported: BGE (`BAAI/bge-large-zh-v1.5`), Qwen (`/data/models/Qwen3-Embedding-4B`), OpenAI (`text-embedding-3-large`), SentenceTransformers.
 
@@ -153,7 +183,9 @@ Supported: BGE (`BAAI/bge-large-zh-v1.5`), Qwen (`/data/models/Qwen3-Embedding-4
 - **100k+ items**: Use `swing_sim_type: jaccard` and `use_sparse: true`
 - **500k+ items**: Ensure sufficient swap space
 - **GPU memory**: Reduce `train_batch_size` or `swing_enhancement` batch size
+- **Attention memory**: `swing_enhance_type=attention` caches `[n_items, k, emb_dim]` on CPU (~6 GB for 350k items, k=10). Reduce `swing_neighbors` if RAM constrained
 - **Caching**: Adjacency matrices and embeddings cached in `./cache/` for fast reload
+- **Overhead**: attention type ~2-3x slower per forward than multiplicative; the other three types have negligible overhead after precomputation
 
 ## Citation
 
