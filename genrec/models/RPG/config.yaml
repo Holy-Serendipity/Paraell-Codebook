@@ -61,6 +61,10 @@ swing_cache: true             # 是否缓存swing相似度矩阵
 swing_sim_type: jaccard       # Swing相似度类型：exact（精确Swing）、jaccard（Jaccard近似）
 sim_type: semantic            # 相似度类型：semantic（语义相似度）、embedding（nn.Embedding相似度）、fusion（融合语义和swing）
 
+# Swing蒸馏配置（方向2）
+use_swing_distill: false              # 是否使用Swing蒸馏token embedding（辅助MSE loss强制物品相似度逼近Swing）
+swing_distill_weight: 0.1             # 蒸馏损失权重
+
 # Swing语义ID增强配置
 use_swing_enhancement: false          # 是否使用Swing增强语义ID
 swing_enhance_weight: 0.3             # Swing增强权重（0-1）
