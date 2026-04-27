@@ -75,5 +75,14 @@ swing_enhance_cache: true             # 是否缓存增强结果
 swing_attention_n_head: 4             # Swing Attention多头注意力的头数（仅attention类型）
 swing_attention_dropout: 0.1          # Swing Attention的dropout率（仅attention类型）
 
+# 低维item-id embedding + Swing增强（方向3）
+use_lowdim_embedding: false           # 是否使用低维item-id embedding
+lowdim_embedding_dim: 32              # 低维embedding维度
+lowdim_swing_weight: 0.3              # Swing邻居聚合混合权重（0-1）
+
+# Swing对比损失标签配置（方向1）
+use_swing_contrastive_labels: false    # 是否使用Swing相似度作为对比损失的真值标签
+swing_contrastive_weight: 1.0         # Swing标签在combined_sim中的权重（1.0=纯Swing，0.0=纯语义）
+
 # 兼容性配置
 use_item_id_embedding: false          # 是否使用item-id embedding（默认禁用）

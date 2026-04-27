@@ -662,7 +662,24 @@ class RPG(AbstractModel):
         self.swing_distill_weight = config.get('swing_distill_weight', 0.1)
         self._swing_sparse_matrix = None
 
-        if self.use_swing:
+        # Swing对比损失标签配置（方向1）
+        self.use_swing_contrastive_labels = config.get('use_swing_contrastive_labels', False)
+        self.swing_contrastive_weight = config.get('swing_contrastive_weight', 1.0)
+
+        # 低维item-id embedding + Swing增强（方向3）
+        self.use_lowdim_embedding = config.get('use_lowdim_embedding', False)
+        if self.use_lowdim_embedding:
+            low_dim = config.get('lowdim_embedding_dim', 32)
+            self.lowdim_embedding = nn.Embedding(
+                num_embeddings=self.dataset.n_items + 1,
+                embedding_dim=low_dim,
+                padding_idx=0
+            )
+            self.lowdim_proj = nn.Linear(low_dim, config['n_embd'])
+            nn.init.zeros_(self.lowdim_proj.bias)
+            self.lowdim_swing_weight = config.get('lowdim_swing_weight', 0.3)
+
+        if self.use_swing or self.use_swing_contrastive_labels:
             from .swing import SwingSimilarity
             self.swing_sim = SwingSimilarity(
                 dataset=self.dataset,
@@ -690,7 +707,8 @@ class RPG(AbstractModel):
         self.gpt2 = GPT2Model(gpt2config)
 
         # Swing增强组件（在gpt2初始化后，以便传递embedding层）
-        if self.use_swing_enhancement:
+        # 当use_swing_enhancement或use_lowdim_embedding为true时都需要初始化（后者需要topk cache）
+        if self.use_swing_enhancement or self.use_lowdim_embedding:
             self.swing_enhancement = SwingEnhancement(config, dataset, tokenizer, embedding_layer=self.gpt2.wte)
             # 预计算相似度矩阵和所有物品embedding（使用no_grad避免梯度计算和内存占用）
             try:
@@ -771,6 +789,15 @@ class RPG(AbstractModel):
             print(f"[WARNING] Failed to compute Swing sim matrix for distillation: {e}")
             self._swing_sparse_matrix = None
 
+    def _ensure_swing_sim(self):
+        """确保Swing相似度矩阵已预计算（使用self.swing_sim，用于对比损失方向1）"""
+        if self._swing_sparse_matrix is not None:
+            return
+        if self.swing_sim is None:
+            raise RuntimeError("SwingSimilarity not initialized (use_swing or use_swing_contrastive_labels required)")
+        self.swing_sim.compute_similarity_matrix(use_sparse=True)
+        self._swing_sparse_matrix = self.swing_sim.get_sparse_similarity_matrix()
+
     def _get_swing_batch_similarity(self, batch_items):
         """从缓存的Swing稀疏矩阵提取batch内物品相似度子矩阵 [bs, bs]
 
@@ -781,7 +808,17 @@ class RPG(AbstractModel):
             [bs, bs] 相似度子矩阵，或None（矩阵未就绪时）
         """
         if self._swing_sparse_matrix is None:
-            return None
+            # 自动初始化：contrastive labels 用 self.swing_sim，distill 走原有路径
+            if self.use_swing_contrastive_labels:
+                try:
+                    self._ensure_swing_sim()
+                except Exception as e:
+                    print(f"[WARNING] Failed to init swing sim for contrastive labels: {e}")
+                    return None
+            else:
+                self._ensure_swing_sim_distill()
+            if self._swing_sparse_matrix is None:
+                return None
 
         sim_matrix = self._swing_sparse_matrix
         if isinstance(batch_items, torch.Tensor):
@@ -858,6 +895,31 @@ class RPG(AbstractModel):
         if self.use_swing_enhancement:
             semantic_embs = self.swing_enhancement(semantic_embs, batch['input_ids'])
 
+        # === 方向3：低维item-id embedding + Swing增强 ===
+        if self.use_lowdim_embedding:
+            lowdim_embs = self.lowdim_embedding(batch['input_ids'])
+
+            # Swing只增强low-dim embedding（不依赖use_swing_enhancement）
+            if self.swing_enhancement.topk_neighbors_cache is not None:
+                neighbor_indices, neighbor_weights = self.swing_enhancement.topk_neighbors_cache
+                flat_items = batch['input_ids'].view(-1)
+                non_pad = flat_items != 0
+                valid_items = flat_items[non_pad]
+
+                if len(valid_items) > 0:
+                    idx = neighbor_indices[valid_items.cpu()].to(flat_items.device)
+                    w = neighbor_weights[valid_items.cpu()].to(flat_items.device)
+                    neighbor_lowdim = self.lowdim_embedding(idx)
+                    agg = torch.sum(w.unsqueeze(-1) * neighbor_lowdim, dim=1)
+
+                    orig = lowdim_embs.view(-1, lowdim_embs.size(-1))[non_pad]
+                    enhanced = (1 - self.lowdim_swing_weight) * orig + self.lowdim_swing_weight * agg
+                    contrib = self.lowdim_proj(enhanced)
+
+                    flat_semantic = semantic_embs.view(-1, semantic_embs.size(-1))
+                    flat_semantic[non_pad] = flat_semantic[non_pad] + contrib
+                    semantic_embs = flat_semantic.view(semantic_embs.shape)
+
         attention_mask = batch['attention_mask']
         semantic_embs = semantic_embs * attention_mask.unsqueeze(-1)
         input_embs = semantic_embs  # 直接使用增强后的语义embedding
@@ -922,14 +984,22 @@ class RPG(AbstractModel):
                 F.normalize(last_semantic_embs, dim=-1).T
             )
 
-            # 如果启用Swing增强，可以结合Swing相似度
-            if self.use_swing_enhancement:
+            # 构建对比损失标签（combined_sim）
+            if self.use_swing_contrastive_labels:
+                # 方向1：Swing相似度作为对比学习真值标签
+                batch_items = batch['input_ids'][torch.arange(bs), last_positions]
+                swing_sim = self._get_swing_batch_similarity(batch_items)
+                if swing_sim is not None:
+                    combined_sim = self.swing_contrastive_weight * swing_sim.to(semantic_similarity.device)
+                    if self.swing_contrastive_weight < 1.0:
+                        combined_sim = combined_sim + (1.0 - self.swing_contrastive_weight) * semantic_similarity
+                else:
+                    combined_sim = semantic_similarity
+            elif self.use_swing_enhancement:
+                # 原有逻辑：结合Swing增强相似度
                 try:
-                    # 获取Swing相似度矩阵
                     swing_sim_matrix = self.swing_enhancement.get_similarity_matrix()
-                    # 提取batch内物品间的Swing相似度
                     batch_items = batch['input_ids'][torch.arange(bs), last_positions]
-                    # 使用新方法提取子矩阵（支持稀疏张量）
                     swing_sim = self.swing_enhancement.get_batch_similarity_submatrix(swing_sim_matrix, batch_items)
                     combined_sim = 0.5 * semantic_similarity + 0.5 * swing_sim
                 except Exception as e:
