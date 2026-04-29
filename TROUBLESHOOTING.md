@@ -77,6 +77,18 @@ AcceleratorError: CUDA error: unknown error
 - Reduce `eval_batch_size`
 - Lower `n_embd` or `n_layer` in model config
 
+### System RAM Out of Memory (80GB+) During Graph Building
+```
+Running out of memory during "Building item-item similarity matrix..." step (eval/generation with --use_graph_decoding)
+```
+**Cause**: `build_ii_sim_mat()` accumulates all item-item pairs above the similarity threshold into Python lists before selecting top-K neighbors. With `n_codebook=128` and large datasets (>100k items), the semantic similarity matrix becomes very dense — even a 1% density for 350k items means ~610M pairs, and Python list overhead can reach 80GB+.
+
+**Fixes**:
+- **Already fixed in code**: `init_graph()` now routes `sim_type='semantic'` (the default) to `build_ii_topk_adjacency()`, which uses `O(n_items × n_edges)` fixed-sized tensors instead of unbounded Python lists. Memory usage is ~210MB for 350k items (vs >80GB before).
+- **`sim_type=fusion` is also fixed**: Uses `_build_fused_adjacency()` which computes semantic and Swing top-K separately and merges per item — never materializes dense matrices. Peak memory < 1 GB for 350k items.
+- To benefit from this fix, ensure `sim_type: semantic` or `sim_type: fusion` in `config.yaml` — no code changes needed.
+- Cached adjacency matrices (`./cache/adjacency_*.pt`) are reused across runs — after a successful first build, subsequent runs skip the computation entirely.
+
 ### Training Stalls at 0% (CPU 98%, GPU 0%)
 **Cause**: Swing enhancement precomputation on first forward pass (one-time cost: ~55s for 212k items).
 
@@ -150,6 +162,23 @@ Jaccard is 10-100x faster than exact Swing. Similarity matrices are cached to di
 RuntimeError: Expected all tensors to be on the same device
 ```
 Latest code handles device transfer automatically. If persisting, force CPU for similarity matrices: set `device='cpu'` in `swing.py` initialization.
+
+### Low-Dim Embedding Not Improving
+- Ensure `use_lowdim_embedding=true`; SwingEnhancement auto-initializes for the top-k cache even without `use_swing_enhancement`
+- Try increasing `lowdim_swing_weight` (default 0.3) for stronger Swing aggregation signal
+- Lower `lowdim_embedding_dim` (e.g., 16) for more aggressive parameter savings
+- Check logs for `[RPG] Precomputing swing similarity matrix` to confirm Swing cache is active
+
+### Contrastive Labels Not Improving
+- Start with `swing_contrastive_weight=0.7` (not 1.0) to retain some semantic signal
+- Verify `swing_alpha` and `swing_min_cooccurrence` produce meaningful similarity values
+- The weight blends as: `combined = weight * swing + (1-weight) * semantic`
+- Direction 1 is orthogonal to directions 2 and 3 — combine freely for best results
+
+### Distillation Loss Not Converging
+- `swing_distill_weight=0.1` is a safe starting point; increase if underfitting
+- Distillation only runs during training, not evaluation — expected if eval shows zero
+- Verify similarity matrix computation completed (check logs for completion message)
 
 ## GPU Issues
 

@@ -1518,11 +1518,128 @@ class RPG(AbstractModel):
         adjacency_values = adjacency_vs.to(device, non_blocking=True)
 
         return adjacency_indices, adjacency_values
-    # def init_graph(self):
-    #     self.tokenizer.log("Building item-item similarity matrix...")
-    #     item_item_sim = self.build_ii_sim_mat()
-    #     self.adjacency = self.build_adjacency_list(item_item_sim)
-    #     self.tokenizer.log("Graph initialized.")
+
+    def _extract_swing_topk(self, K=None):
+        """从缓存的Swing稀疏矩阵中提取每个物品的top-K邻居（无需稠密化）
+
+        Returns:
+            swing_idx: (n_items, K) int64, 邻居物品ID, -1表示无有效邻居
+            swing_val: (n_items, K) float32, 对应的相似度
+        """
+        if K is None:
+            K = self.n_edges
+        n_items = self.dataset.n_items
+
+        # 确保swing相似度矩阵已计算并缓存
+        self._ensure_swing_sim()
+        if self._swing_sparse_matrix is None:
+            self.tokenizer.log("Swing sparse matrix not available, using identity adjacency")
+            swing_idx = torch.full((n_items, K), -1, dtype=torch.long)
+            swing_val = torch.zeros(n_items, K, dtype=torch.float32)
+            return swing_idx, swing_val
+
+        swing_sim = self._swing_sparse_matrix.coalesce()
+        indices = swing_sim.indices().cpu()
+        values = swing_sim.values().cpu()
+
+        row_counts = torch.bincount(indices[0], minlength=n_items)
+        row_starts = torch.cumsum(row_counts, dim=0) - row_counts
+
+        swing_idx = torch.full((n_items, K), -1, dtype=torch.long)
+        swing_val = torch.zeros(n_items, K, dtype=torch.float32)
+
+        for i in range(n_items):
+            start = row_starts[i].item()
+            count = row_counts[i].item()
+            if count == 0:
+                continue
+            cols = indices[1][start:start + count]
+            vals = values[start:start + count]
+
+            # 排除自环
+            non_self = cols != i
+            cols, vals = cols[non_self], vals[non_self]
+
+            if vals.numel() == 0:
+                continue
+
+            k_actual = min(vals.numel(), K)
+            topv, topi = torch.topk(vals, k=k_actual)
+            swing_idx[i, :k_actual] = cols[topi]
+            swing_val[i, :k_actual] = topv
+
+        return swing_idx, swing_val
+
+    def _build_fused_adjacency(self):
+        """构建融合Swing+语义的top-K邻接矩阵（内存高效，无需稠密化）
+
+        分别计算语义和Swing的top-K邻居，然后对每个物品合并候选列表，
+        按 fused = (1-w)*sem + w*swing 打分，取top-K。
+
+        Returns:
+            adjacency_indices: (n_items, n_edges) int64, 每个物品的top-K邻居
+        """
+        K = self.n_edges
+        sw = self.swing_weight
+        n_items = self.dataset.n_items
+        device = self.gpt2.device if hasattr(self, 'gpt2') else next(self.parameters()).device
+
+        # Step 1: 语义top-K（已有的内存高效方法）
+        self.tokenizer.log("Computing semantic top-K adjacency...")
+        sem_idx, sem_val = self.build_ii_topk_adjacency(
+            use_threshold=False, threshold=0.5, use_half=False
+        )
+
+        # Step 2: Swing top-K
+        self.tokenizer.log("Extracting swing top-K neighbors...")
+        swing_idx, swing_val = self._extract_swing_topk(K)
+
+        # Step 3: 在CPU上逐物品融合
+        self.tokenizer.log("Fusing semantic and swing adjacencies...")
+        sem_idx_cpu = sem_idx.cpu()
+        sem_val_cpu = sem_val.cpu()
+        swing_idx_cpu = swing_idx.cpu()
+        swing_val_cpu = swing_val.cpu()
+        # 释放GPU内存
+        del sem_idx, sem_val
+
+        sem_w = 1.0 - sw
+        swg_w = sw
+
+        fused_idx = torch.full((n_items, K), -1, dtype=torch.long)
+
+        chunk_size = 5000
+        for chunk_start in range(0, n_items, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_items)
+            for i in range(chunk_start, chunk_end):
+                cands = {}
+
+                # 语义候选 (1-w)*sem
+                for j in range(K):
+                    nid = int(sem_idx_cpu[i, j])
+                    if nid >= 0:
+                        cands[nid] = sem_w * float(sem_val_cpu[i, j])
+
+                # Swing候选 w*swing
+                for j in range(K):
+                    nid = int(swing_idx_cpu[i, j])
+                    if nid >= 0:
+                        cands[nid] = cands.get(nid, 0.0) + swg_w * float(swing_val_cpu[i, j])
+
+                if not cands:
+                    fused_idx[i, 0] = i
+                    continue
+
+                sorted_cands = sorted(cands.items(), key=lambda x: x[1], reverse=True)
+                for rank, (nid, _) in enumerate(sorted_cands[:K]):
+                    fused_idx[i, rank] = nid
+
+            if (chunk_start // chunk_size) % 10 == 0:
+                self.tokenizer.log(f"  Fusion progress: {chunk_end}/{n_items}")
+
+        self.tokenizer.log("Fusion complete.")
+        return fused_idx.to(device, non_blocking=True)
+
     def init_graph(self):
         # Check if adjacency matrix is already initialized
         if hasattr(self, 'adjacency') and self.adjacency is not None:
@@ -1541,7 +1658,11 @@ class RPG(AbstractModel):
         swing_weight = self.config.get('swing_weight', 0.5)
 
         if use_swing:
-            cache_suffix = f"{sim_type}_swing{swing_weight:.2f}"
+            n_edges = self.config.get('n_edges', self.n_edges)
+            swing_alpha = self.config.get('swing_alpha', 1.0)
+            swing_min_co = self.config.get('swing_min_cooccurrence', 2)
+            swing_sim_type = self.config.get('swing_sim_type', 'jaccard')
+            cache_suffix = f"{sim_type}_swing{swing_weight:.2f}_alpha{swing_alpha}_minco{swing_min_co}_{swing_sim_type}_K{n_edges}"
         else:
             cache_suffix = sim_type
 
@@ -1560,26 +1681,27 @@ class RPG(AbstractModel):
         self.tokenizer.log("Building item-item similarity matrix... (this may take a while)")
 
         # 根据配置选择相似度计算方式
+        # 注意：build_ii_sim_mat + build_adjacency_list 会收集所有 > threshold 的pair到Python列表，
+        # 在大规模数据集（>100k items）且 n_codebook 较大时，语义相似度密度极高，
+        # Python列表可能消耗数十GB内存。故语义相似度应走 build_ii_topk_adjacency 的top-K路径。
         sim_type = self.config.get('sim_type', 'semantic')
         use_swing = self.config.get('use_swing', False)
 
-        if use_swing or sim_type in ['fusion', 'embedding']:
-            # 使用build_ii_sim_mat构建相似度矩阵（支持swing融合）
+        if sim_type == 'fusion':
+            if not use_swing:
+                raise ValueError("fusion sim_type 需要启用 use_swing=True")
+            # 使用内存高效的 top-K 融合路径（无需稠密化，O(n_items * n_edges)）
+            self.tokenizer.log(f"Building fused adjacency (semantic + swing, weight={swing_weight})")
+            self.adjacency = self._build_fused_adjacency()
+        elif sim_type == 'embedding':
             sim_threshold = 0.5
             use_half = False
-            self.tokenizer.log(f"Using similarity type: {sim_type}, swing enabled: {use_swing}")
-
-            # 构建相似度矩阵
-            item_item_sim = self.build_ii_sim_mat(
-                threshold=sim_threshold,
-                use_half=use_half,
-                sim_type=sim_type
-            )
-
-            # 从相似度矩阵构建邻接列表
+            item_item_sim = self._build_base_sim_mat(threshold=sim_threshold, use_half=use_half)
             self.adjacency = self.build_adjacency_list(item_item_sim)
         else:
-            # 使用原有的优化方法（语义相似度）
+            # 语义相似度（默认）：使用高效的内存受限 top-K 邻接矩阵构建
+            # 内存占用 O(n_items * n_edges)，在大规模数据集上安全
+            self.tokenizer.log(f"Using efficient top-k adjacency for sim_type: {sim_type}")
             adj_idx, _ = self.build_ii_topk_adjacency(
                 use_threshold=False,
                 threshold=0.5,
