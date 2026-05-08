@@ -264,6 +264,33 @@ class Netease(AbstractDataset):
         else:
             raise NotImplementedError('Metadata processing type not implemented.')
         return item2meta
+    def _load_cover_urls(self, input_csv: str, item2id: dict) -> dict:
+        """从data_items.csv第4列(cover)提取封面图URL。
+
+        Args:
+            input_csv: data_items.csv路径
+            item2id: item_id映射表
+
+        Returns:
+            dict: {item_id: cover_url, ...}，无封面图的item为空字符串
+        """
+        cover_urls = {}
+        item_ids = set(item2id.keys())
+        try:
+            with open(input_csv, 'r', encoding='utf-8') as csvfile:
+                reader = csv.reader(csvfile)
+                next(reader)  # skip header
+                for row in reader:
+                    if len(row) >= 4:
+                        key = str(row[0].strip())
+                        if key not in item_ids:
+                            continue
+                        cover_urls[key] = row[3].strip()
+            self.log(f'[Dataset] Loaded {len(cover_urls)} cover URLs')
+        except Exception as e:
+            self.log(f'[Dataset] Failed to load cover URLs: {e}')
+        return cover_urls
+
     def process_raw(self):
         raw_data_path = os.path.join(self.cache_dir, 'raw')
         os.makedirs(raw_data_path, exist_ok=True)
@@ -283,3 +310,7 @@ class Netease(AbstractDataset):
             input_path=raw_data_path,
             output_path=processed_data_path
         )
+
+        # 加载封面图URL
+        input_csv = os.path.join(raw_data_path, 'data_items.csv')
+        self.cover_urls = self._load_cover_urls(input_csv, self.item2id)

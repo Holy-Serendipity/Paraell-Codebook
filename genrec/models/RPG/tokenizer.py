@@ -20,6 +20,28 @@ except Exception as e:
     # Log a warning but don't raise - vllm may not be needed for all embedding models
     import warnings
     warnings.warn(f"vllm import failed: {e}. This may not affect functionality if not using vllm-based embedding models.")
+
+try:
+    from PIL import Image
+    import requests
+    from io import BytesIO
+    import torch
+    HAS_IMAGE_IO = True
+except Exception as e:
+    Image = None
+    requests = None
+    BytesIO = None
+    HAS_IMAGE_IO = False
+    warnings.warn(f"image I/O imports failed: {e}. Image embedding will not be available.")
+
+try:
+    from transformers import CLIPModel, CLIPProcessor
+    HAS_HF_CLIP = True
+except Exception as e:
+    CLIPModel = None
+    CLIPProcessor = None
+    HAS_HF_CLIP = False
+    warnings.warn(f"HuggingFace CLIP import failed: {e}. Image embedding will not be available.")
 class RPGTokenizer(AbstractTokenizer):
     """
     An example when "codebook_size == 256, n_codebooks == 32":
@@ -45,6 +67,13 @@ class RPGTokenizer(AbstractTokenizer):
     def __init__(self, config: dict, dataset: AbstractDataset):
         self.n_codebook_bits = self._get_codebook_bits(config['codebook_size'])
         self.index_factory = f'OPQ{config["n_codebook"]},IVF1,PQ{config["n_codebook"]}x{self.n_codebook_bits}'
+
+        # 多模态图像配置
+        self.use_img_embedding = config.get('use_img_embedding', False)
+        self.img_codebook = config.get('img_codebook', 0) if self.use_img_embedding else 0
+        self.img_emb_model = config.get('img_emb_model', '')
+        self.img_emb_dim = config.get('img_emb_dim', 512)
+        self.img_emb_batch_size = config.get('img_emb_batch_size', 64)
 
         super(RPGTokenizer, self).__init__(config, dataset)
         # Debug dataset structure
@@ -84,9 +113,11 @@ class RPGTokenizer(AbstractTokenizer):
         """
         Returns the number of digits for the tokenizer.
 
-        The number of digits is determined by the value of `rq_n_codebooks` in the configuration.
+        Text codebooks + image codebooks (if enabled).
         """
-        return self.config['n_codebook']
+        text_n = self.config['n_codebook']
+        img_n = self.config.get('img_codebook', 0) if self.config.get('use_img_embedding', False) else 0
+        return text_n + img_n
 
     @property
     def codebook_size(self):
@@ -221,8 +252,188 @@ class RPGTokenizer(AbstractTokenizer):
                     sent_embs.append(response.embedding)
             sent_embs = np.array(sent_embs, dtype=np.float32)
 
+        # 释放模型显存
+        if 'sent_emb_model' in dir():
+            del sent_emb_model
+            if 'torch' in globals() or 'torch' in locals():
+                torch.cuda.empty_cache()
         sent_embs.tofile(output_path)
         return sent_embs
+
+    # ── 图像Embedding ──────────────────────────────────────────
+
+    def _load_image(self, item_id: str, cover_url: str, cache_dir: str) -> Image.Image:
+        """加载封面图：优先读本地缓存，失败则从URL下载。
+
+        Returns:
+            PIL.Image or None: 加载成功的图像，失败返回None
+        """
+        # 尝试本地缓存
+        local_path = os.path.join(cache_dir, 'images', f'{item_id}.jpg')
+        if os.path.exists(local_path):
+            try:
+                return Image.open(local_path).convert('RGB')
+            except Exception:
+                pass
+
+        # 从URL下载
+        if not HAS_IMAGE_IO or requests is None:
+            return None
+        try:
+            resp = requests.get(cover_url, timeout=10)
+            resp.raise_for_status()
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, 'wb') as f:
+                f.write(resp.content)
+            return Image.open(BytesIO(resp.content)).convert('RGB')
+        except Exception:
+            return None
+
+    def _encode_img_emb(self, dataset: AbstractDataset, output_path: str) -> np.ndarray:
+        """用HuggingFace CLIP编码封面图embeddings并缓存（加载到GPU）。
+
+        Returns:
+            np.ndarray: shape=(n_items-1, img_emb_dim)，第i行对应item_id=i+1。
+                        无封面图的item对应行全零。
+        """
+        n_items = dataset.n_items - 1
+        img_embs = np.zeros((n_items, self.img_emb_dim), dtype=np.float32)
+
+        if not HAS_HF_CLIP or CLIPModel is None:
+            self.log('[TOKENIZER] HuggingFace CLIP not available, using zero image embeddings')
+            img_embs.tofile(output_path)
+            return img_embs
+
+        cover_urls = getattr(dataset, 'cover_urls', None) or {}
+        if not cover_urls:
+            self.log('[TOKENIZER] No cover URLs found, using zero image embeddings')
+            img_embs.tofile(output_path)
+            return img_embs
+
+        # 从本地路径加载CLIP，FP16减少内存
+        self.log(f'[TOKENIZER] Loading CLIP model from {self.img_emb_model}')
+        clip_model = CLIPModel.from_pretrained(self.img_emb_model, torch_dtype=torch.float16)
+        clip_processor = CLIPProcessor.from_pretrained(self.img_emb_model, use_fast=False)
+        clip_model.eval()
+        device = self.config.get('device', 'cuda')
+        clip_model.to(device)
+
+        cache_dir = dataset.cache_dir
+        # 只收集元信息（idx, item_id, url），不加载图片
+        valid_items = []  # [(img_idx, item_id, cover_url), ...]
+        for i in range(1, dataset.n_items):
+            item_id = dataset.id_mapping['id2item'][i]
+            cover_url = cover_urls.get(str(item_id), '')
+            if cover_url:
+                valid_items.append((i - 1, str(item_id), cover_url))
+
+        self.log(f'[TOKENIZER] Encoding {len(valid_items)} cover images ('
+                 f'{n_items - len(valid_items)} items have no cover)')
+
+        # 分批加载+编码，避免所有图片同时驻留内存
+        batch_size = self.img_emb_batch_size
+        for start in tqdm(range(0, len(valid_items), batch_size),
+                          desc='Encoding images', unit='batch'):
+            batch_items = valid_items[start:start + batch_size]
+            # 按需加载当前批次的图片
+            batch_imgs = []
+            batch_indices = []
+            for img_idx, item_id, cover_url in batch_items:
+                img = self._load_image(item_id, cover_url, cache_dir)
+                if img is not None:
+                    batch_imgs.append(img)
+                    batch_indices.append(img_idx)
+            if not batch_imgs:
+                continue
+            inputs = clip_processor(images=batch_imgs, return_tensors='pt')
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                embs = clip_model.get_image_features(**inputs).cpu().numpy()
+            img_embs[batch_indices] = embs
+            # 当前批次的图片即刻释放
+            del batch_imgs, batch_items
+
+        # 释放CLIP模型和元数据内存
+        del clip_model, clip_processor, valid_items
+        torch.cuda.empty_cache()
+        import gc; gc.collect()
+        self.log(f'[TOKENIZER] Image embeddings shape: {img_embs.shape}')
+        img_embs.tofile(output_path)
+        return img_embs
+
+    def _generate_semantic_id_img(self, img_embs: np.ndarray, sem_ids_path: str):
+        """对图像embedding进行OPQ量化，生成图像语义ID。
+
+        Args:
+            img_embs: shape=(n_items-1, img_emb_dim) 的图像embedding
+            sem_ids_path: 输出缓存路径
+        """
+        if img_embs.shape[0] == 0:
+            self.log('[TOKENIZER] No image embeddings, skipping OPQ')
+            return
+
+        img_codebook = self.config['img_codebook']
+        img_bits = self.n_codebook_bits  # same bits as text (8 for codebook_size=256)
+        img_factory = f'OPQ{img_codebook},IVF1,PQ{img_codebook}x{img_bits}'
+
+        self.log(f'[TOKENIZER] Training image OPQ index: {img_factory}')
+        faiss.omp_set_num_threads(self.config.get('faiss_omp_num_threads', 4))
+
+        index = faiss.index_factory(
+            img_embs.shape[1],
+            img_factory,
+            faiss.METRIC_INNER_PRODUCT
+        )
+
+        use_gpu = self.config.get('opq_use_gpu', False) and self.img_emb_dim <= 2048
+        if use_gpu and hasattr(faiss, 'StandardGpuResources'):
+            try:
+                res = faiss.StandardGpuResources()
+                index = faiss.index_cpu_to_gpu(res, self.config.get('opq_gpu_id', 0), index)
+                self.log('[TOKENIZER] Image OPQ on GPU')
+            except Exception:
+                use_gpu = False
+
+        # Train on ALL items (image content is independent of user interactions)
+        index.train(img_embs)
+        index.add(img_embs)
+
+        if use_gpu:
+            index = faiss.index_gpu_to_cpu(index)
+
+        # Extract PQ codes
+        ivf_index = faiss.downcast_index(index.index)
+        invlists = faiss.extract_index_ivf(ivf_index).invlists
+        ls = invlists.list_size(0)
+        pq_codes = faiss.rev_swig_ptr(invlists.get_codes(0), ls * invlists.code_size)
+        pq_codes = pq_codes.reshape(-1, invlists.code_size)
+
+        # Decode PQ codes to per-codebook indices
+        faiss_sem_ids = []
+        n_bytes = pq_codes.shape[1]
+        for u8code in pq_codes:
+            bs = faiss.BitstringReader(faiss.swig_ptr(u8code), n_bytes)
+            code = []
+            for i in range(img_codebook):
+                code.append(bs.read(img_bits))
+            faiss_sem_ids.append(code)
+        pq_codes = np.array(faiss_sem_ids)
+
+        # Build {item_id: tuple(img_sem_ids)} mapping
+        item2img_ids = {}
+        for i in range(pq_codes.shape[0]):
+            item_id = i + 1
+            if item_id >= len(self.id2item):
+                continue
+            item = self.id2item[item_id]
+            item2img_ids[item] = tuple(pq_codes[i].tolist())
+
+        self.log(f'[TOKENIZER] Saving image semantic IDs to {sem_ids_path}')
+        with open(sem_ids_path, 'w') as f:
+            json.dump(item2img_ids, f)
+        self.log(f'[TOKENIZER] Image semantic IDs saved, {len(item2img_ids)} items')
+
+    # ── 训练Mask ────────────────────────────────────────────────
 
     def _get_items_for_training(self, dataset: AbstractDataset) -> np.ndarray:
         """
@@ -273,7 +484,7 @@ class RPGTokenizer(AbstractTokenizer):
                     res.setTempMemory(1024 * 1024 * 512)
                     if hasattr(faiss, 'GpuClonerOptions'):
                         co = faiss.GpuClonerOptions()
-                        co.useFloat16 = self.n_digit >= 56
+                        co.useFloat16 = self.config['n_codebook'] >= 56
                     gpu_initialized = True
                     self.log(f'[TOKENIZER] GPU FAISS initialized successfully')
                 except Exception as e:
@@ -324,7 +535,7 @@ class RPGTokenizer(AbstractTokenizer):
         for u8code in pq_codes:
             bs = faiss.BitstringReader(faiss.swig_ptr(u8code), n_bytes)
             code = []
-            for i in range(self.n_digit):
+            for i in range(self.config['n_codebook']):
                 code.append(bs.read(self.n_codebook_bits))
             faiss_sem_ids.append(code)
         pq_codes = np.array(faiss_sem_ids)
@@ -450,9 +661,51 @@ class RPGTokenizer(AbstractTokenizer):
                     f'[TOKENIZER] Training item mask shape: {training_item_mask.shape}, sum: {training_item_mask.sum()}')
                 self._generate_semantic_id_opq(sent_embs, sem_ids_path, training_item_mask)
 
+                # 释放文本embedding和OPQ训练的大内存，为CLIP腾空间
+                del sent_embs, training_item_mask
+                import gc; gc.collect()
+                self.log(f'[TOKENIZER] Freed text embedding memory before loading image models')
+
             self.log(f'[TOKENIZER] Loading semantic IDs from {sem_ids_path}...')
             item2sem_ids = json.load(open(sem_ids_path, 'r'))
-            self.log(f'[TOKENIZER] Loaded {len(item2sem_ids)} semantic IDs')
+            self.log(f'[TOKENIZER] Loaded {len(item2sem_ids)} text semantic IDs')
+
+            # ── 图像语义ID路径 ────────────────────────────────
+            if self.use_img_embedding:
+                img_model_name = os.path.basename(self.img_emb_model)
+                img_sem_ids_path = os.path.join(
+                    dataset.cache_dir, 'processed',
+                    f'{img_model_name}_OPQ{self.img_codebook}x{self.n_codebook_bits}.img_sem_ids'
+                )
+
+                if not os.path.exists(img_sem_ids_path):
+                    # Load or encode image embeddings
+                    img_emb_path = os.path.join(
+                        dataset.cache_dir, 'processed',
+                        f'{img_model_name}.img_emb'
+                    )
+
+                    if os.path.exists(img_emb_path):
+                        self.log(f'[TOKENIZER] Loading image embeddings from {img_emb_path}...')
+                        img_embs = np.fromfile(img_emb_path, dtype=np.float32).reshape(-1, self.img_emb_dim)
+                    else:
+                        self.log(f'[TOKENIZER] Encoding image embeddings...')
+                        img_embs = self._encode_img_emb(dataset, img_emb_path)
+
+                    self._generate_semantic_id_img(img_embs, img_sem_ids_path)
+
+                self.log(f'[TOKENIZER] Loading image semantic IDs from {img_sem_ids_path}...')
+                img_item2sem_ids = json.load(open(img_sem_ids_path, 'r'))
+                self.log(f'[TOKENIZER] Loaded {len(img_item2sem_ids)} image semantic IDs')
+
+                # 拼接文本+图像语义ID: text_ids(32,) + img_ids(8,) = (40,)
+                for item in list(item2sem_ids.keys()):
+                    text_ids = item2sem_ids[item]
+                    img_ids = img_item2sem_ids.get(item, tuple([0] * self.img_codebook))
+                    item2sem_ids[item] = text_ids + img_ids
+
+                self.log(f'[TOKENIZER] Concatenated text+image semantic IDs (total n_digit={self.n_digit})')
+
             item2tokens = self._sem_ids_to_tokens(item2sem_ids)
 
             return item2tokens

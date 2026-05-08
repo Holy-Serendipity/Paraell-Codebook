@@ -84,5 +84,12 @@ lowdim_swing_weight: 0.3              # Swing邻居聚合混合权重（0-1）
 use_swing_contrastive_labels: false    # 是否使用Swing相似度作为对比损失的真值标签
 swing_contrastive_weight: 1.0         # Swing标签在combined_sim中的权重（1.0=纯Swing，0.0=纯语义）
 
+# 多模态配置：封面图CLIP embedding + 独立OPQ量化
+use_img_embedding: false              # 是否启用图像语义ID
+img_emb_model: "openai/clip-vit-base-patch32"  # CLIP图像编码模型
+img_emb_dim: 512                      # CLIP输出维度（vit-base-patch32=512）
+img_codebook: 8                       # 图像codebook数量（文本为32，总计40）
+img_emb_batch_size: 64                # CLIP编码batch size
+
 # 兼容性配置
 use_item_id_embedding: false          # 是否使用item-id embedding（默认禁用）

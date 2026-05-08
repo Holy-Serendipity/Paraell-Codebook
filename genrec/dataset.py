@@ -16,6 +16,7 @@ class AbstractDataset:
             'id2item': ['[PAD]']
         }
         self.item2meta = None
+        self.cover_urls = None
         self.split_data = None
 
     def __str__(self) -> str:
