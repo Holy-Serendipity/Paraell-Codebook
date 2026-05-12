@@ -1,0 +1,6 @@
+name: 'Pixel'
+min_interactions: 5 # 最小交互次数
+max_interactions: None  # 最大交互次数限制
+sort_method: 'time'  # 时间排序方式
+metadata: 'sentence'  # 元数据处理模式: none, raw, sentence
+split: leave_one_out

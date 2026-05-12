@@ -1,0 +1,15 @@
+/req.txt
+/core
+/test.py
+/models/
+/logs/
+/cache/
+/wandb/
+/requirements.txt
+.idea
+genrec/__pycache__/
+*.py[cod]
+*$py.class
+__pycache__/
+/recommendations.json
+.claude/

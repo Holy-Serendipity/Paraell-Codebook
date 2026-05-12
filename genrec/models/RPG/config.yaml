@@ -1,0 +1,92 @@
+# Overwritting configs
+metadata: sentence
+
+# Config the sentence embedding model
+#   Sentence T5
+#sent_emb_model: /root/parade/models/bge-m3
+#sent_emb_dim: 1024
+#sent_emb_pca: 512
+#   OpenAI Embedding Model
+#sent_emb_model: text-embedding-3-large
+#sent_emb_dim: 3072
+#sent_emb_pca: 512
+#openai_api_key: ~
+#   Qwen3-Embedding
+sent_emb_model: /data/models/Qwen3-Embedding-4B
+sent_emb_dim: 2560
+sent_emb_pca: 512
+sent_emb_batch_size: 512
+
+# Config for the backbone model
+max_item_seq_len: 50
+n_embd: 448
+n_layer: 2
+n_head: 4
+n_inner: 1024
+activation_function: gelu_new
+use_swiglu: false                       # 是否用SwiGLU替换GELU MLP
+resid_pdrop: 0.0
+embd_pdrop: 0.5
+attn_pdrop: 0.5
+layer_norm_epsilon: 1e-12
+initializer_range: 0.02
+
+# Semantic ID configs
+n_codebook: 32
+codebook_size: 256
+opq_use_gpu: True
+opq_gpu_id: 0
+faiss_omp_num_threads: 32
+
+# RPG configs
+#   model
+temperature: 0.07
+num_beams: 50
+n_edges: 50
+propagation_steps: 3
+num_groups: 8
+group_temperature: 0.05
+group_loss_weight: 0.5
+consistency_loss_weight: 0.05
+pos_threshold: 0.5
+#   decoding graph construction
+chunk_size: 1024
+num_workers: 64
+
+# Swing algorithm configs
+use_swing: false              # 是否使用swing算法
+swing_weight: 0.5             # swing相似度权重（0-1）
+swing_alpha: 1.0              # swing算法平滑参数
+swing_min_cooccurrence: 2     # 最小共同出现次数阈值
+swing_cache: true             # 是否缓存swing相似度矩阵
+swing_sim_type: jaccard       # Swing相似度类型：exact（精确Swing）、jaccard（Jaccard近似）
+sim_type: semantic            # 相似度类型：semantic（语义相似度）、embedding（nn.Embedding相似度）、fusion（融合语义和swing）
+
+# Swing语义ID增强配置
+use_swing_enhancement: false          # 是否使用Swing增强语义ID
+swing_enhance_weight: 0.3             # Swing增强权重（0-1）
+swing_neighbors: 10                   # 用于增强的邻居数量
+swing_enhance_type: gated     # 增强类型：gated/graph/attention
+swing_enhance_activation: false       # graph增强是否使用激活函数（GELU）
+swing_enhance_cache: true             # 是否缓存增强结果
+swing_attention_n_head: 4             # Swing Attention多头注意力的头数（仅attention类型）
+swing_attention_dropout: 0.1          # Swing Attention的dropout率（仅attention类型）
+
+# 低维item-id embedding + Swing增强（方向3）
+use_lowdim_embedding: false           # 是否使用低维item-id embedding
+lowdim_embedding_dim: 32              # 低维embedding维度
+lowdim_swing_weight: 0.3              # Swing邻居聚合混合权重（0-1）
+
+# Swing对比损失标签配置（方向1）
+use_swing_contrastive_labels: false    # 是否使用Swing相似度作为对比损失的真值标签
+swing_contrastive_weight: 1.0         # Swing标签在combined_sim中的权重（1.0=纯Swing，0.0=纯语义）
+
+# 多模态配置：封面图CLIP embedding + 独立OPQ量化
+use_img_embedding: false              # 是否启用图像语义ID
+img_emb_model: "openai/clip-vit-base-patch32"  # CLIP图像编码模型
+img_emb_dim: 512                      # CLIP输出维度（vit-base-patch32=512）
+img_codebook: 8                       # 图像codebook数量（文本为32，总计40）
+img_emb_batch_size: 64                # CLIP编码batch size
+
+# 兼容性配置
+use_item_id_embedding: false          # 是否使用item-id embedding（默认禁用）

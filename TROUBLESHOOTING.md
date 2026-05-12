@@ -1,0 +1,210 @@
+# RPPG Troubleshooting Guide
+
+## Setup Issues
+
+### Circular Import Error
+```
+ImportError: cannot import name 'Pipeline' from partially initialized module 'genrec.pipeline'
+```
+**Cause**: Circular dependency between `pipeline.py` and `recommender.py`.
+
+**Fix**: Ensure `genrec/recommender.py` does not import `Pipeline` from `genrec.pipeline`. Clear cache:
+```bash
+find . -name "*.pyc" -delete && find . -name "__pycache__" -type d -exec rm -rf {} +
+python -c "from genrec.pipeline import Pipeline; print('OK')"
+```
+
+### ModuleNotFoundError: No module named 'genrec'
+**Fix**: Run from project root or add to PYTHONPATH:
+```bash
+export PYTHONPATH=/path/to/Paraell-Codebook:$PYTHONPATH
+cd /path/to/Paraell-Codebook && python main.py ...
+```
+
+### Missing Embedding Model
+```
+ModuleNotFoundError: No module named 'FlagEmbedding'
+```
+Config specifies `sent_emb_model: /data/models/Qwen3-Embedding-4B` by default.
+
+**Fixes**:
+- Download the model to the configured path
+- Switch to an auto-downloading model: `sent_emb_model: BAAI/bge-large-zh-v1.5`
+- Install dependencies: `pip install sentence-transformers FlagEmbedding`
+
+## Data Issues
+
+### FileNotFoundError for Data Files
+**Required structure** for Netease:
+```
+/data/cache/Netease/raw/
+├── data_likes.csv    # role_id,work_id,ts
+└── data_items.csv    # item_id,metadata
+```
+
+**For testing**, create minimal samples:
+```bash
+mkdir -p /data/cache/Netease/raw/
+echo -e "role_id,work_id,ts\nuser1,item1,2023-01-01" > /data/cache/Netease/raw/data_likes.csv
+echo -e "item_id,metadata\nitem1,Test Song" > /data/cache/Netease/raw/data_items.csv
+```
+
+## Training Issues
+
+### CUDA Unknown Error / DataLoader Freeze
+```
+RuntimeError: CUDA error: unknown error
+— or —
+AcceleratorError: CUDA error: unknown error
+```
+**Cause**: On Linux, PyTorch's DataLoader uses `fork` by default. Forking after CUDA initialization creates child processes with corrupted CUDA context. This occurs when `num_workers > 0` with CUDA.
+
+**Fixes** (pick one):
+1. **No multiprocessing** (simple, no data parallelism):
+   ```python
+   DataLoader(..., num_workers=0, pin_memory=False)
+   ```
+2. **Spawn mode** (data parallelism works):
+   ```python
+   import torch.multiprocessing
+   DataLoader(..., num_workers=4, multiprocessing_context='spawn', pin_memory=False)
+   ```
+3. **Set `num_workers=0`** in `genrec/pipeline.py` (already the default in current code).
+
+### CUDA Out of Memory
+**Fixes**:
+- Reduce `train_batch_size` in `config.yaml`
+- Reduce `eval_batch_size`
+- Lower `n_embd` or `n_layer` in model config
+
+### System RAM Out of Memory (80GB+) During Graph Building
+```
+Running out of memory during "Building item-item similarity matrix..." step (eval/generation with --use_graph_decoding)
+```
+**Cause**: `build_ii_sim_mat()` accumulates all item-item pairs above the similarity threshold into Python lists before selecting top-K neighbors. With `n_codebook=128` and large datasets (>100k items), the semantic similarity matrix becomes very dense — even a 1% density for 350k items means ~610M pairs, and Python list overhead can reach 80GB+.
+
+**Fixes**:
+- **Already fixed in code**: `init_graph()` now routes `sim_type='semantic'` (the default) to `build_ii_topk_adjacency()`, which uses `O(n_items × n_edges)` fixed-sized tensors instead of unbounded Python lists. Memory usage is ~210MB for 350k items (vs >80GB before).
+- **`sim_type=fusion` is also fixed**: Uses `_build_fused_adjacency()` which computes semantic and Swing top-K separately and merges per item — never materializes dense matrices. Peak memory < 1 GB for 350k items.
+- To benefit from this fix, ensure `sim_type: semantic` or `sim_type: fusion` in `config.yaml` — no code changes needed.
+- Cached adjacency matrices (`./cache/adjacency_*.pt`) are reused across runs — after a successful first build, subsequent runs skip the computation entirely.
+
+### Training Stalls at 0% (CPU 98%, GPU 0%)
+**Cause**: Swing enhancement precomputation on first forward pass (one-time cost: ~55s for 212k items).
+
+**Fix**: Wait for precompletion, or manually trigger before training:
+```python
+model.swing_enhancement.precompute_topk_neighbors()
+```
+
+### No Improvement with Swing Enhancement
+- Start with small weight (`swing_enhance_weight: 0.1`)
+- Verify similarity matrix contains meaningful values
+- Check logs for `[SwingEnhancement]` messages confirming enhancement is active
+- Try different `swing_enhance_type` — each has different behavior:
+  - `gated` — learnable feature-level soft selection; default
+  - `graph` — more expressive but needs more data
+  - `attention` — highest capacity but most memory
+
+### Swing Attention: Dimension Mismatch
+```
+AssertionError: n_embd(448) must be divisible by n_head(X)
+```
+**Cause**: `n_embd` must be divisible by `swing_attention_n_head`. Default `n_embd=448` works with heads 1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112, 224.
+
+**Fix**: Set `swing_attention_n_head` to a divisor of `n_embd` (default: 4).
+
+### Swing Attention: High Memory Usage
+The attention type caches `topk_neighbor_embs` as `[n_items, k, emb_dim]` — for a 350k-item catalog with `k=10`, `emb_dim=448`, this is ~5.9 GB (FP32) or ~3.0 GB (FP16). All data stays on CPU; only per-batch slices are moved to GPU during forward pass.
+
+**Fixes**:
+- Reduce `swing_neighbors` (k) to lower memory
+- Ensure sufficient system RAM for the CPU cache
+- Monitor with `torch.cuda.memory_summary()` for GPU OOM
+
+## Generation Issues
+
+### Missing Model Checkpoint
+```
+FileNotFoundError: Checkpoint file not found: /path/to/model.pth
+```
+**Fixes**: Train first (`python main.py --mode train --model RPG --dataset Netease`), then use the checkpoint saved to `ckpt_dir`.
+
+### Scores Are All Negative
+**Expected**: Scores are log probabilities from `log_softmax` — always ≤ 0. Higher (closer to 0) is better. Convert to probability: `exp(score)`.
+
+### Output Shows Small Numbers (1, 2, 3) Instead of Item IDs
+**Cause**: Token IDs not converted back to original item IDs.
+
+**Fix**: Check that `_token_id_to_item_id()` in `genrec/recommender.py` maps correctly.
+
+### Slow First Run with Graph Decoding
+Building the item-item similarity matrix is expensive for large datasets. The adjacency matrix is cached to `./cache/` after first build — subsequent runs load in seconds.
+
+### too many values to unpack (expected 2)
+**Cause**: Graph-constrained decoding returns 3 values, standard returns 2. Latest code handles both — update to the current version.
+
+## Swing Algorithm Issues
+
+### Memory Exhaustion
+```
+Killed
+```
+- Use Jaccard approximation: `swing_sim_type: jaccard`
+- Ensure `use_sparse: true` in config
+- Increase swap space for 500k+ items
+
+### Slow Similarity Computation
+Jaccard is 10-100x faster than exact Swing. Similarity matrices are cached to disk automatically after first computation.
+
+### Device Mismatch
+```
+RuntimeError: Expected all tensors to be on the same device
+```
+Latest code handles device transfer automatically. If persisting, force CPU for similarity matrices: set `device='cpu'` in `swing.py` initialization.
+
+### Low-Dim Embedding Not Improving
+- Ensure `use_lowdim_embedding=true`; SwingEnhancement auto-initializes for the top-k cache even without `use_swing_enhancement`
+- Try increasing `lowdim_swing_weight` (default 0.3) for stronger Swing aggregation signal
+- Lower `lowdim_embedding_dim` (e.g., 16) for more aggressive parameter savings
+- Check logs for `[RPG] Precomputing swing similarity matrix` to confirm Swing cache is active
+
+### Contrastive Labels Not Improving
+- Start with `swing_contrastive_weight=0.7` (not 1.0) to retain some semantic signal
+- Verify `swing_alpha` and `swing_min_cooccurrence` produce meaningful similarity values
+- The weight blends as: `combined = weight * swing + (1-weight) * semantic`
+- Direction 1 is orthogonal to directions 2 and 3 — combine freely for best results
+
+## GPU Issues
+
+### GPU Not Utilized
+- Check `torch.cuda.is_available()` returns True
+- Default batch size 8192 for precomputation — may need tuning for your GPU
+- Code falls back to CPU automatically if GPU memory insufficient
+
+### CUDA Out of Memory During Precomputation
+- Reduce `batch_size` in `precompute_topk_neighbors()` in `genrec/models/RPG/model.py`
+- Force CPU: set `use_gpu = False` in the same method
+- Clear cache: `torch.cuda.empty_cache()`
+
+## Diagnostics
+
+```bash
+# Check environment
+python --version
+python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+python -c "from genrec.pipeline import Pipeline; print('Import OK')"
+
+# Verify data
+ls -la /data/cache/Netease/raw/ 2>/dev/null || echo "Data not found"
+
+# Find checkpoints
+find . -name "*.pth" -o -name "*.pt" 2>/dev/null | head -5
+```
+
+## Need More Help?
+
+1. Check console logs for detailed error messages and stack traces
+2. Verify paths in `genrec/default.yaml` and `genrec/models/RPG/config.yaml`
+3. Ensure read/write permissions for data and output directories
+4. Pull the latest code: `git pull origin main`
