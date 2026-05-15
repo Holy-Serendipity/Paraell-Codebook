@@ -116,9 +116,9 @@ python main.py --use_img_embedding=true
 
 ```bibtex
 @article{fucecf2025,
-  title={FuceCF: Parallel Codebook Generative Recommendation},
-  author={Your Name},
+  title={FuceCF},
+  author={Li Jiaming},
   journal={arXiv preprint},
-  year={2025}
+  year={2026}
 }
 ```
